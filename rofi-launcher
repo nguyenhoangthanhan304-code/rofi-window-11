@@ -1,0 +1,2972 @@
+#!/usr/bin/env python3
+"""
+Ohio  -  PyQt6   (rofi-style launcher)
+-------------------------------------
+Header buttons (left -> right):
+    moon / sun  = switch DARK <-> LIGHT mode
+    terminal    = FILES mode: every public file + folder in your user profile,
+                  sortable by Name / Modified / Size / Type  (System32, AppData,
+                  Program Files, hidden + system stuff is never shown)
+    window      = APPS mode (default)
+    gear        = SETTINGS: paste a banner / background path, blur, tilt, accent ...
+
+Keys:
+    type        filter            Up/Down  move          Enter  launch / open
+    Shift+Enter reveal file in its folder                Tab    apps <-> files
+    Ctrl+,      settings                                 Esc    close
+    ">cmd"      run a command     "?words"  web search
+
+NEW in this version
+    * going into / out of a folder slides the old list away and the new rows fly in
+    * the path bar slides open, the path is "typed" out with a caret, the ">" button ripples
+    * header buttons squish when held, bounce + ripple on click, and their icons spin / wiggle
+    * the sort bar slides open, the accent pill glides between chips, the arrow rotates,
+      chips pop in one by one, hover fades, click bounce, status text slides
+
+Settings are saved to  ~/.config/quick_launcher/config.json
+
+Install:  pip install PyQt6
+Run:      python ohio.py
+          python ohio.py --bg "C:/Pictures/bg.jpg" --banner "C:/Pictures/banner.png"
+"""
+import argparse
+import configparser
+import ctypes
+import hashlib
+import json
+import math
+import os
+import pickle
+import re
+import shlex
+import subprocess
+import sys
+import webbrowser
+from functools import lru_cache
+from operator import attrgetter
+from pathlib import Path
+from urllib.parse import quote_plus
+
+from PyQt6.QtCore import (QEasingCurve, QFileInfo, QLocale, QPoint, QPointF, QRectF,
+                          QSize, Qt, QThread, QTimer, QUrl, QVariantAnimation, pyqtSignal)
+from PyQt6.QtGui import (QBrush, QColor, QConicalGradient, QCursor, QFont, QFontMetrics,
+                         QGuiApplication, QIcon, QImage, QImageReader, QLinearGradient,
+                         QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
+                         QRadialGradient, QRegion, QTransform)
+from PyQt6.QtWidgets import (QApplication, QFileDialog, QFileIconProvider, QFrame,
+                             QGraphicsBlurEffect, QGraphicsItem, QGraphicsPixmapItem,
+                             QGraphicsRectItem, QGraphicsScene, QGraphicsView,
+                             QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider,
+                             QVBoxLayout, QWidget)
+
+# ============================================================================
+# CONFIG  -  defaults.  Most of these can be changed live in the gear menu.
+# ============================================================================
+DEFAULT_CFG = {
+    "background_image": "",     # "" = your current wallpaper
+    "background_blur": 0,       # 0 = sharp, 20-40 = frosted
+    "background_dim": 40,       # 0..255 darkening over the background
+    "banner_image": "",         # "" = reuse the background image
+    "banner_focus_y": 0.35,     # which part of the banner shows: 0 = top, 1 = bottom
+    "accent": "#a8f5ea",        # selected pill colour, or "auto" (taken from the banner)
+    "max_tilt": 30.0,           # degrees (0 = no tilt)
+    "dark": True,               # dark / light mode
+    "extra_roots": [],          # extra folders for FILES mode, e.g. ["D:/Games", "E:/Media"]
+    "file_sort": "date",        # name | date | size | type
+    "file_sort_asc": False,
+}
+CFG = dict(DEFAULT_CFG)
+CONFIG_DIR = Path.home() / ".config" / "quick_launcher"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+INDEX_CACHE = CONFIG_DIR / "file_index.pkl"
+
+WIN_W, WIN_H = 1100, 800      # menu panel size (unchanged)
+MARGIN = 50                   # panel inset (unchanged)
+CARD_W, CARD_H = 700, 600     # the menu card (unchanged)
+HEADER_H = 200                # banner height (unchanged)
+EXTRA = 400                   # extra transparent space around the menu so the tilt is never cut off
+                              # (the window is made bigger by this much on every side; auto-capped to your screen)
+MENU_SCALE = 1.0              # make the whole menu bigger (1.0 = old size). Auto-capped so it fits your screen
+CARD_RADIUS = 30
+PANEL_RADIUS = 38
+BG_PAD = 80                   # extra background around the panel for parallax
+
+TILT_SMOOTHING = 0.14         # 0..1  (lower = floatier)
+INVERT_TILT = False
+
+SCROLL_SPEED = 2.4            # higher = faster wheel scrolling
+SCROLL_EASE = 0.24            # 0..1  higher = snappier, lower = floatier
+ITEM_CACHE = True             # cache the card as a texture while it tilts (much less lag)
+
+INTRO_MS = 900                # pop-in (scale / flip)
+INTRO_SEQ_MS = 1250           # pop-in (rows, buttons, sweep, glow)
+INTRO_FLIP = 55.0             # degrees the menu flips up from
+INTRO_ROLL = 6.0              # degrees of roll it straightens out of
+POP_OUT_SCALE = 0.22          # how much the menu grows when launching
+POP_OUT_MS = 380
+
+# --- folder / list transition ------------------------------------------------
+TRANSITION_MS = 640           # how long the list "push" transition takes
+TRANSITION_SLIDE = 90         # px the rows travel while sliding in / out
+BAR_SLIDE_MS = 420            # path bar / sort bar open + close time
+PATH_TYPE_MS = 560            # path text "typing" time
+
+MAX_FILES = 250000            # safety cap for the file index
+MONO_FAMILIES = ["Space Mono", "JetBrains Mono", "Cascadia Code", "Consolas",
+                 "SF Mono", "Menlo", "DejaVu Sans Mono", "Monospace"]
+FONT_FAMILIES = ["Inter", "SF Pro Display", "Segoe UI", "Hiragino Sans",
+                 "Yu Gothic UI", "Noto Sans CJK JP", "Noto Sans", "Sans Serif"]
+HOME = str(Path.home())
+
+
+def load_config():
+    try:
+        data = json.loads(CONFIG_FILE.read_text("utf-8"))
+        for k, v in data.items():
+            if k in DEFAULT_CFG:
+                CFG[k] = v
+    except Exception:
+        pass
+
+
+def save_config():
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(CFG, indent=2), "utf-8")
+    except Exception as ex:
+        print("Could not save config:", ex)
+
+
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+def clamp(v, lo=0.0, hi=1.0):
+    return max(lo, min(hi, v))
+
+
+def with_alpha(c, a):
+    c = QColor(c)
+    c.setAlpha(int(clamp(a, 0, 255)))
+    return c
+
+
+def lerp_color(a, b, t):
+    t = clamp(t)
+    return QColor(int(a.red() + (b.red() - a.red()) * t),
+                  int(a.green() + (b.green() - a.green()) * t),
+                  int(a.blue() + (b.blue() - a.blue()) * t),
+                  int(a.alpha() + (b.alpha() - a.alpha()) * t))
+
+
+def ease_out_cubic(t):
+    return 1 - (1 - t) ** 3
+
+
+def ease_out_back(t, s=2.4):
+    t = t - 1
+    return 1 + (s + 1) * t ** 3 + s * t ** 2
+
+
+def mono_font(px, weight=QFont.Weight.Normal):
+    f = QFont()
+    f.setFamilies(MONO_FAMILIES)
+    f.setPixelSize(px)
+    f.setWeight(weight)
+    return f
+
+
+def clean_path(text):
+    t = (text or "").strip().strip('"').strip("'").strip()
+    if t.lower().startswith("file:"):
+        t = QUrl(t).toLocalFile() or t
+    return t
+
+
+def resolve_path(text):
+    return os.path.expanduser(clean_path(text))
+
+
+def valid_image(text):
+    p = resolve_path(text)
+    try:
+        return bool(p) and os.path.isfile(p) and QImageReader(p).canRead()
+    except Exception:
+        return False
+
+
+class Theme:
+    """t = 0 dark ... 1 light (animated)."""
+    def __init__(self, dark=True):
+        self.t = 0.0 if dark else 1.0
+
+    def mix(self, dark, light):
+        return lerp_color(dark, light, self.t)
+
+
+LIST_BG = (QColor(5, 11, 11, 250), QColor(243, 249, 248, 250))
+TEXT = (QColor(190, 232, 226), QColor(30, 62, 60))
+DIM = (QColor(190, 232, 226, 115), QColor(30, 62, 60, 135))
+HOVER = (QColor(255, 255, 255, 18), QColor(0, 0, 0, 16))
+CHIP = (QColor(255, 255, 255, 20), QColor(0, 0, 0, 18))
+SCROLLC = (QColor(255, 255, 255, 70), QColor(0, 0, 0, 70))
+EDGE = (QColor(255, 255, 255, 30), QColor(0, 0, 0, 45))
+SEL_TEXT = QColor(4, 30, 28)
+
+
+# ----------------------------------------------------------------------------
+# Items: apps + files
+# ----------------------------------------------------------------------------
+KNOWN = {
+    "chrome": "Fast, secure web browser from Google.",
+    "firefox": "Privacy-focused open source web browser.",
+    "edge": "Microsoft's modern web browser.",
+    "brave": "Private browser with built-in ad blocking.",
+    "visual studio code": "Lightweight but powerful source code editor.",
+    "terminal": "Command-line terminal emulator.",
+    "powershell": "Task automation shell and scripting language.",
+    "notepad": "Simple, quick plain-text editor.",
+    "calculator": "Standard, scientific and programmer calculator.",
+    "paint": "Draw, edit and annotate images.",
+    "word": "Create and edit rich documents.",
+    "excel": "Spreadsheets, formulas, charts and data analysis.",
+    "powerpoint": "Design and present slide shows.",
+    "outlook": "Email, calendar and contacts in one place.",
+    "spotify": "Stream music, podcasts and playlists.",
+    "discord": "Voice, video and text chat for communities.",
+    "steam": "Game store, library and community.",
+    "obs": "Record and live-stream your screen.",
+    "vlc": "Plays almost any audio or video format.",
+    "blender": "Free 3D modelling, animation and rendering.",
+    "settings": "Personalise and configure your system.",
+    "explorer": "Browse files and folders.",
+}
+
+
+def describe(name):
+    low = name.lower()
+    for key, text in KNOWN.items():
+        if re.search(rf"\b{re.escape(key)}\b", low):
+            return text
+    return f"Open {name} and start using it right away."
+
+
+@lru_cache(maxsize=4096)
+def accent_for(name):
+    h = int(hashlib.md5(name.encode("utf-8")).hexdigest()[:4], 16) % 360 / 360.0
+    return (QColor.fromHslF(h, 0.68, 0.60), QColor.fromHslF((h + 0.10) % 1.0, 0.72, 0.58))
+
+
+class App:
+    kind = "app"
+    parent = ""
+
+    def __init__(self, name, command, description="", category="Application", icon_hint=None):
+        self.name = name
+        self.command = command
+        self.description = description or describe(name)
+        self.category = category
+        self.icon_hint = icon_hint
+        self.hay = f"{name} {category} {self.description}".lower()
+        self.icon_key = ("app", name.lower())
+        self._icon = None
+        self._icon_loaded = False
+
+    @property
+    def icon(self):
+        if not self._icon_loaded:
+            self._icon_loaded = True
+            self._icon = self._load_icon()
+        return self._icon
+
+    def _load_icon(self):
+        global _provider
+        try:
+            ic = None
+            if sys.platform.startswith("linux"):
+                h = self.icon_hint
+                if h:
+                    ic = QIcon(h) if os.path.isabs(h) and os.path.exists(h) else QIcon.fromTheme(h)
+            else:
+                if _provider is None:
+                    _provider = QFileIconProvider()
+                ic = _provider.icon(QFileInfo(self.icon_hint or self.command))
+            if ic is not None and not ic.isNull():
+                pm = ic.pixmap(QSize(128, 128))
+                if not pm.isNull():
+                    return pm
+        except Exception:
+            pass
+        return None
+
+
+_provider = None
+
+
+class FileItem:
+    kind = "file"
+    __slots__ = ("path", "name", "name_l", "parent", "mtime", "size", "is_dir", "ext", "icon_key")
+    PER_FILE_ICON = {".exe", ".lnk", ".ico", ".url", ".msi", ".appref-ms"}
+
+    def __init__(self, path, mtime, size, is_dir):
+        self.path = path
+        self.name = os.path.basename(path)
+        self.name_l = self.name.lower()
+        par = os.path.dirname(path)
+        self.parent = ("~" + par[len(HOME):]) if par.startswith(HOME) else par
+        self.mtime = mtime
+        self.size = size
+        self.is_dir = is_dir
+        self.ext = "" if is_dir else os.path.splitext(self.name_l)[1]
+        if is_dir:
+            self.icon_key = ("dir",)
+        elif self.ext in self.PER_FILE_ICON:
+            self.icon_key = ("file", path)
+        else:
+            self.icon_key = ("ext", self.ext)
+
+
+_icon_cache = {}
+
+
+def item_icon(item):
+    key = item.icon_key
+    if key in _icon_cache:
+        return _icon_cache[key]
+    pm = None
+    try:
+        if item.kind == "file":
+            global _provider
+            if _provider is None:
+                _provider = QFileIconProvider()
+            if item.is_dir:
+                ic = _provider.icon(QFileIconProvider.IconType.Folder)
+            else:
+                ic = _provider.icon(QFileInfo(item.path))
+            pm = ic.pixmap(QSize(56, 56))
+        else:
+            pm = item.icon
+        if pm is not None and not pm.isNull():
+            pm = pm.scaled(56, 56, Qt.AspectRatioMode.KeepAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+        else:
+            pm = None
+    except Exception:
+        pm = None
+    _icon_cache[key] = pm
+    return pm
+
+
+def draw_fallback_icon(p, name, rect, radius=8):
+    c1, c2 = accent_for(name.lower() if name else "?")
+    g = QLinearGradient(rect.topLeft(), rect.bottomRight())
+    g.setColorAt(0, c1)
+    g.setColorAt(1, c2)
+    path = QPainterPath()
+    path.addRoundedRect(rect, radius, radius)
+    p.fillPath(path, g)
+    f = QFont(p.font())
+    f.setBold(True)
+    f.setPixelSize(int(rect.height() * 0.46))
+    p.setFont(f)
+    p.setPen(QColor(255, 255, 255, 235))
+    p.drawText(rect, Qt.AlignmentFlag.AlignCenter, (name[:1] or "?").upper())
+
+
+# ----------------------------------------------------------------------------
+# App discovery + launching
+# ----------------------------------------------------------------------------
+def discover_apps():
+    apps = {}
+    try:
+        if sys.platform.startswith("win"):
+            roots = [
+                Path(os.environ.get("ProgramData", "C:/ProgramData")) / "Microsoft/Windows/Start Menu/Programs",
+                Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs",
+            ]
+            for root in roots:
+                if not root.exists():
+                    continue
+                for f in root.rglob("*.lnk"):
+                    name = f.stem
+                    if re.search(r"uninstall|readme|release notes|license|documentation|\bhelp\b", name, re.I):
+                        continue
+                    cat = f.parent.name if f.parent != root else "Application"
+                    apps.setdefault(name.lower(), App(name, str(f), category=cat))
+        elif sys.platform == "darwin":
+            dirs = ["/Applications", "/Applications/Utilities", "/System/Applications",
+                    "/System/Applications/Utilities", str(Path.home() / "Applications")]
+            for d in dirs:
+                p = Path(d)
+                if not p.exists():
+                    continue
+                for f in p.glob("*.app"):
+                    apps.setdefault(f.stem.lower(), App(f.stem, str(f), category=p.name or "Application"))
+        else:
+            dirs = ["/usr/share/applications", "/usr/local/share/applications",
+                    str(Path.home() / ".local/share/applications"),
+                    "/var/lib/flatpak/exports/share/applications",
+                    str(Path.home() / ".local/share/flatpak/exports/share/applications")]
+            loc = QLocale().name()
+            lang = loc.split("_")[0]
+            for d in dirs:
+                p = Path(d)
+                if not p.exists():
+                    continue
+                for f in p.glob("*.desktop"):
+                    cp = configparser.ConfigParser(interpolation=None, strict=False)
+                    try:
+                        cp.read(f, encoding="utf-8")
+                        e = cp["Desktop Entry"]
+                    except Exception:
+                        continue
+                    if e.get("NoDisplay", "false").lower() == "true" or e.get("Hidden", "false").lower() == "true":
+                        continue
+                    if e.get("Type", "Application") != "Application" or "Exec" not in e:
+                        continue
+                    name = e.get(f"Name[{loc}]") or e.get(f"Name[{lang}]") or e.get("Name", f.stem)
+                    desc = e.get(f"Comment[{loc}]") or e.get(f"Comment[{lang}]") or e.get("Comment", "")
+                    cats = [c for c in e.get("Categories", "").split(";") if c]
+                    apps.setdefault(name.lower(), App(name, e["Exec"], desc,
+                                                      cats[0] if cats else "Application",
+                                                      e.get("Icon")))
+    except Exception as ex:
+        print("App discovery problem:", ex)
+    return sorted(apps.values(), key=lambda a: a.name.casefold())
+
+
+def launch_app(app):
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(app.command)  # noqa
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", app.command])
+        else:
+            cmd = re.sub(r"%[a-zA-Z%]", "", app.command).strip()
+            subprocess.Popen(shlex.split(cmd), start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as ex:
+        print("Launch failed:", ex)
+
+
+def open_path(path):
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # noqa
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as ex:
+        print("Open failed:", ex)
+
+
+def reveal_path(path):
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(path)], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as ex:
+        print("Reveal failed:", ex)
+
+
+def run_command(text):
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(f'start "" {text}', shell=True)
+        else:
+            subprocess.Popen(text, shell=True, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as ex:
+        print("Run failed:", ex)
+
+
+# ----------------------------------------------------------------------------
+# File index (background thread; only "public" user files)
+# ----------------------------------------------------------------------------
+SKIP_DIRS = {
+    "appdata", "windows", "system32", "syswow64", "winsxs", "program files",
+    "program files (x86)", "programdata", "$recycle.bin", "system volume information",
+    "recovery", "config.msi", "msocache", "node_modules", "__pycache__", "site-packages",
+    "venv", "env", "dist-packages", "proc", "sys", "dev", "run", "snap",
+}
+if sys.platform == "darwin":
+    SKIP_DIRS |= {"library", "system", "private"}
+SKIP_FILES = {"desktop.ini", "thumbs.db", "ntuser.dat", ".ds_store"}
+
+
+def list_dir(path):
+    """Contents of one folder (same 'public files only' rules as the index)."""
+    out = []
+    try:
+        with os.scandir(path) as it:
+            for en in it:
+                try:
+                    name = en.name
+                    if name.startswith(".") or en.is_symlink():
+                        continue
+                    st = en.stat(follow_symlinks=False)
+                    attrs = getattr(st, "st_file_attributes", 0)
+                    if attrs & 0x6:
+                        continue
+                    if en.is_dir(follow_symlinks=False):
+                        if attrs & 0x400 or name.lower() in SKIP_DIRS:
+                            continue
+                        out.append(FileItem(en.path, st.st_mtime, 0, True))
+                    else:
+                        if name.lower() in SKIP_FILES:
+                            continue
+                        out.append(FileItem(en.path, st.st_mtime, st.st_size, False))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    for it in out:
+        it.parent = ""
+    return out
+
+
+class FileIndexer(QThread):
+    loaded = pyqtSignal(object)     # quick result from the on-disk cache
+    done = pyqtSignal(object)       # fresh full scan
+    progress = pyqtSignal(int)
+
+    def __init__(self, roots):
+        super().__init__()
+        self.roots = roots
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        sig = "|".join(self.roots)
+        try:
+            with open(INDEX_CACHE, "rb") as fh:
+                data = pickle.load(fh)
+            if data.get("sig") == sig and not self._stop:
+                self.loaded.emit([FileItem(*t) for t in data["items"]])
+        except Exception:
+            pass
+
+        tuples = []
+        stack = list(self.roots)
+        count = 0
+        while stack and not self._stop and count < MAX_FILES:
+            d = stack.pop()
+            try:
+                it = os.scandir(d)
+            except OSError:
+                continue
+            with it:
+                for en in it:
+                    if self._stop:
+                        break
+                    try:
+                        name = en.name
+                        low = name.lower()
+                        if name.startswith(".") or en.is_symlink():
+                            continue
+                        st = en.stat(follow_symlinks=False)
+                        attrs = getattr(st, "st_file_attributes", 0)
+                        if attrs & 0x6:                     # hidden | system
+                            continue
+                        if en.is_dir(follow_symlinks=False):
+                            if attrs & 0x400 or low in SKIP_DIRS:   # reparse point / system folder
+                                continue
+                            stack.append(en.path)
+                            tuples.append((en.path, st.st_mtime, 0, True))
+                        else:
+                            if low in SKIP_FILES:
+                                continue
+                            tuples.append((en.path, st.st_mtime, st.st_size, False))
+                        count += 1
+                        if count % 4000 == 0:
+                            self.progress.emit(count)
+                    except OSError:
+                        continue
+        if self._stop:
+            return
+        items = [FileItem(*t) for t in tuples]
+        self.done.emit(items)
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(INDEX_CACHE, "wb") as fh:
+                pickle.dump({"sig": sig, "items": tuples}, fh, protocol=4)
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Wallpaper / background / banner
+# ----------------------------------------------------------------------------
+def get_wallpaper_path():
+    try:
+        if sys.platform.startswith("win"):
+            buf = ctypes.create_unicode_buffer(512)
+            ctypes.windll.user32.SystemParametersInfoW(0x0073, len(buf), buf, 0)
+            if buf.value and os.path.exists(buf.value):
+                return buf.value
+            tw = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Themes/TranscodedWallpaper"
+            if tw.exists():
+                return str(tw)
+        elif sys.platform == "darwin":
+            out = subprocess.run(
+                ["osascript", "-e", 'tell application "System Events" to get picture of current desktop'],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+            if out and os.path.exists(out):
+                return out
+        else:
+            for key in ("picture-uri-dark", "picture-uri"):
+                out = subprocess.run(["gsettings", "get", "org.gnome.desktop.background", key],
+                                     capture_output=True, text=True, timeout=3).stdout.strip().strip("'\"")
+                if out.startswith("file://"):
+                    out = out[7:]
+                if out and os.path.exists(out):
+                    return out
+    except Exception:
+        pass
+    return None
+
+
+def background_source_path():
+    if valid_image(CFG["background_image"]):
+        return resolve_path(CFG["background_image"])
+    return get_wallpaper_path()
+
+
+def fallback_wallpaper(w, h):
+    img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+    p = QPainter(img)
+    g = QLinearGradient(0, 0, w, h)
+    g.setColorAt(0.0, QColor("#f7a8c4"))
+    g.setColorAt(0.5, QColor("#d76d97"))
+    g.setColorAt(1.0, QColor("#7b5ea7"))
+    p.fillRect(0, 0, w, h, g)
+    p.end()
+    return QPixmap.fromImage(img)
+
+
+def build_background(w, h):
+    path = background_source_path()
+    pm = QPixmap(path) if path else QPixmap()
+    if pm.isNull():
+        pm = fallback_wallpaper(w, h)
+    bw, bh = w + 2 * BG_PAD, h + 2 * BG_PAD
+    pm = pm.scaled(bw, bh, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                   Qt.TransformationMode.SmoothTransformation)
+    pm = pm.copy((pm.width() - bw) // 2, (pm.height() - bh) // 2, bw, bh)
+
+    blur = int(CFG["background_blur"])
+    if blur > 0:
+        scene = QGraphicsScene()
+        item = QGraphicsPixmapItem(pm)
+        eff = QGraphicsBlurEffect()
+        eff.setBlurRadius(blur)
+        eff.setBlurHints(QGraphicsBlurEffect.BlurHint.QualityHint)
+        item.setGraphicsEffect(eff)
+        scene.addItem(item)
+        img = QImage(bw, bh, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        scene.render(p, QRectF(0, 0, bw, bh), QRectF(0, 0, bw, bh))
+        p.end()
+    else:
+        img = pm.toImage().convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+
+    p = QPainter(img)
+    p.fillRect(0, 0, bw, bh, QColor(8, 10, 22, int(clamp(CFG["background_dim"], 0, 255))))
+    p.end()
+    return QPixmap.fromImage(img)
+
+
+def build_banner():
+    if valid_image(CFG["banner_image"]):
+        path = resolve_path(CFG["banner_image"])
+    else:
+        path = get_wallpaper_path()            # never follows the background setting
+    pm = QPixmap(path) if path else QPixmap()
+    if pm.isNull():
+        pm = fallback_wallpaper(CARD_W, HEADER_H)
+    pm = pm.scaled(CARD_W, HEADER_H, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                   Qt.TransformationMode.SmoothTransformation)
+    x = (pm.width() - CARD_W) // 2
+    y = int((pm.height() - HEADER_H) * clamp(float(CFG["banner_focus_y"])))
+    return pm.copy(x, y, CARD_W, HEADER_H)
+
+
+def resolve_accent(banner):
+    if str(CFG["accent"]).lower() == "auto":
+        c = banner.toImage().scaled(1, 1, Qt.AspectRatioMode.IgnoreAspectRatio,
+                                    Qt.TransformationMode.SmoothTransformation).pixelColor(0, 0)
+        h = c.hslHueF()
+        if h < 0:
+            h = 0.45
+        return QColor.fromHslF(h, clamp(c.hslSaturationF(), 0.45, 0.9), 0.80)
+    c = QColor(str(CFG["accent"]))
+    return c if c.isValid() else QColor("#a8f5ea")
+
+
+# ----------------------------------------------------------------------------
+# Glyphs for the round buttons
+# ----------------------------------------------------------------------------
+def draw_glyph(p, kind, c, color):
+    p.save()
+    p.translate(c)
+    pen = QPen(color, 2.1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    if kind == "search":
+        p.drawEllipse(QPointF(-2, -2), 6, 6)
+        p.drawLine(QPointF(2.5, 2.5), QPointF(7.5, 7.5))
+    elif kind == "moon":
+        a = QPainterPath()
+        a.addEllipse(QPointF(0, 0), 8, 8)
+        b = QPainterPath()
+        b.addEllipse(QPointF(4.5, -3.5), 7, 7)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawPath(a.subtracted(b))
+    elif kind == "sun":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(QPointF(0, 0), 4.2, 4.2)
+        p.setPen(QPen(color, 1.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        for i in range(8):
+            a = math.radians(i * 45)
+            p.drawLine(QPointF(math.cos(a) * 6.6, math.sin(a) * 6.6),
+                       QPointF(math.cos(a) * 8.8, math.sin(a) * 8.8))
+    elif kind == "term":
+        p.drawPolyline(QPolygonF([QPointF(-8, -5), QPointF(-3, 0), QPointF(-8, 5)]))
+        p.drawLine(QPointF(1, 6), QPointF(8, 6))
+    elif kind == "gear":
+        p.drawEllipse(QPointF(0, 0), 5.2, 5.2)
+        p.setPen(QPen(color, 3.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        for i in range(6):
+            a = math.radians(i * 60)
+            p.drawLine(QPointF(math.cos(a) * 6.8, math.sin(a) * 6.8),
+                       QPointF(math.cos(a) * 7.8, math.sin(a) * 7.8))
+    else:  # window
+        p.drawRoundedRect(QRectF(-8, -6.5, 16, 13), 2.5, 2.5)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawRect(QRectF(-7.5, -6, 15, 4))
+    p.restore()
+
+
+class RoundButton(QWidget):
+    """Round header button.
+    Click animation: squishes while held, springs back with a bounce on release,
+    a ring + flash ripples out of it, and the icon does its own little move
+    (moon/sun spin, gear turns, the others pop + wiggle)."""
+    clicked = pyqtSignal()
+
+    def __init__(self, kind, accent, look="mode"):
+        super().__init__()
+        self.kind = kind
+        self.accent = accent
+        self.look = look            # "mode" | "theme"
+        self.active = False
+        self.hov = 0.0
+        self.pop = 1.0
+        self.press = 0.0            # 0 = idle, 1 = fully squished (mouse held down)
+        self.click_t = 1.0          # 0 -> 1 click animation progress (1 = finished)
+        self._down = False
+        self.setFixedSize(56, 56)          # 42px circle + 7px free room on every side for the click bounce
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(160)
+        self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.anim.valueChanged.connect(self._set_hov)
+
+        self.press_anim = QVariantAnimation(self)
+        self.press_anim.setDuration(110)
+        self.press_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.press_anim.valueChanged.connect(self._set_press)
+
+        self.click_anim = QVariantAnimation(self)
+        self.click_anim.setDuration(720)
+        self.click_anim.setEasingCurve(QEasingCurve.Type.Linear)
+        self.click_anim.setStartValue(0.0)
+        self.click_anim.setEndValue(1.0)
+        self.click_anim.valueChanged.connect(self._set_click)
+        self.click_anim.finished.connect(self._click_done)
+
+    def _set_hov(self, v):
+        self.hov = float(v)
+        self.update()
+
+    def _set_press(self, v):
+        self.press = float(v)
+        self.update()
+
+    def _set_click(self, v):
+        self.click_t = float(v)
+        self.update()
+
+    def _click_done(self):
+        self.click_t = 1.0
+        self.update()
+
+    def _go(self, t):
+        self.anim.stop()
+        self.anim.setStartValue(self.hov)
+        self.anim.setEndValue(t)
+        self.anim.start()
+
+    def _press_to(self, t):
+        self.press_anim.stop()
+        self.press_anim.setStartValue(self.press)
+        self.press_anim.setEndValue(t)
+        self.press_anim.start()
+
+    def play_click(self):
+        self.click_t = 0.0
+        self.click_anim.stop()
+        self.click_anim.start()
+
+    def set_active(self, a):
+        newly = a and not self.active
+        self.active = a
+        if newly and self.isVisible():
+            self.play_click()           # also bounces when activated from the keyboard (Tab)
+        self.update()
+
+    def set_kind(self, k):
+        self.kind = k
+        self.update()
+
+    def set_accent(self, c):
+        self.accent = c
+        self.update()
+
+    def set_pop(self, v):
+        if abs(v - self.pop) > 1e-4:
+            self.pop = v
+            self.update()
+
+    def enterEvent(self, e):
+        self._go(1.0)
+
+    def leaveEvent(self, e):
+        self._go(0.0)
+
+    def mousePressEvent(self, e):
+        # must ACCEPT the press, otherwise Qt never delivers the release inside the tilting view
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._down = True
+            self._press_to(1.0)
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        was = self._down
+        self._down = False
+        self._press_to(0.0)
+        if was and e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.play_click()
+            self.clicked.emit()
+        e.accept()
+
+    def paintEvent(self, e):
+        if self.pop <= 0.001:
+            return
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing)
+        p.setOpacity(clamp(self.pop * 1.6))
+        ct = self.click_t
+        te = ease_out_cubic(ct)
+        c = QPointF(28, 28)
+
+        # squish while held + damped spring bounce after the click
+        bounce = 0.22 * math.exp(-5.5 * ct) * math.sin(ct * 15.0) if ct < 1.0 else 0.0
+        s = max(0.0, self.pop) * (1 + 0.07 * self.hov) * (1 - 0.15 * self.press) * (1 + bounce)
+        p.translate(c)
+        p.scale(s, s)
+        p.translate(-c)
+        r = QRectF(7, 7, 42, 42)
+        p.setPen(Qt.PenStyle.NoPen)
+        if self.look == "theme":
+            p.setBrush(self.accent)
+            p.drawEllipse(r)
+            glyph = QColor(6, 30, 28)
+        else:
+            p.setBrush(QColor(18, 20, 22, int(125 + 70 * self.hov + 60 * self.press)))
+            p.drawEllipse(r)
+            if self.active:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(with_alpha(self.accent, 235), 2.0))
+                p.drawEllipse(r.adjusted(1, 1, -1, -1))
+                glyph = self.accent
+            else:
+                glyph = QColor(235, 245, 243)
+
+        # ripple: a soft accent fill grows out of the centre + a thin ring expands and fades
+        fade = 1 - te
+        if ct < 1.0:
+            p.save()
+            clip = QPainterPath()
+            clip.addEllipse(r)
+            p.setClipPath(clip)
+            flash = QColor(255, 255, 255) if self.look == "theme" else self.accent
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(with_alpha(flash, 235 * fade * fade))
+            rad = 24 * ease_out_cubic(clamp(ct * 2.2))
+            p.drawEllipse(c, rad, rad)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(with_alpha(flash, 200 * fade), 2.0))
+            rr = 4 + 17 * te
+            p.drawEllipse(c, rr, rr)
+            p.restore()
+            # keep the icon readable on top of the flash: fade it to a dark colour while the fill is strong
+            if self.look != "theme":
+                glyph = lerp_color(glyph, SEL_TEXT, clamp(fade * fade * 1.4))
+
+        # the icon's own motion
+        angle = 0.0
+        if self.kind in ("moon", "sun"):
+            angle = 360.0 * te                                  # spin
+        elif self.kind == "gear":
+            angle = 360.0 * te                                  # turn
+        elif ct < 1.0:
+            angle = 16.0 * math.sin(ct * math.pi * 4) * (1 - ct)  # little wiggle
+        gs = 1 + 0.28 * math.sin(math.pi * min(1.0, ct * 1.15)) if ct < 1.0 else 1.0
+        p.save()
+        p.translate(c)
+        p.rotate(angle)
+        p.scale(gs, gs)
+        p.translate(-c)
+        draw_glyph(p, self.kind, c, glyph)
+        p.restore()
+
+
+# ----------------------------------------------------------------------------
+# Search box
+# ----------------------------------------------------------------------------
+class SearchEdit(QLineEdit):
+    activated = pyqtSignal()
+    reveal = pyqtSignal()
+    nav = pyqtSignal(int)
+    escaped = pyqtSignal()
+    tab = pyqtSignal()
+    settings = pyqtSignal()
+
+    def focusNextPrevChild(self, nxt):
+        return False
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        mods = e.modifiers()
+        if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if mods & Qt.KeyboardModifier.ShiftModifier:
+                self.reveal.emit()
+            else:
+                self.activated.emit()
+        elif k == Qt.Key.Key_Down:
+            self.nav.emit(1)
+        elif k == Qt.Key.Key_Up:
+            self.nav.emit(-1)
+        elif k == Qt.Key.Key_PageDown:
+            self.nav.emit(7)
+        elif k == Qt.Key.Key_PageUp:
+            self.nav.emit(-7)
+        elif k == Qt.Key.Key_Escape:
+            self.escaped.emit()
+        elif k == Qt.Key.Key_Tab:
+            self.tab.emit()
+        elif k == Qt.Key.Key_Comma and (mods & Qt.KeyboardModifier.ControlModifier):
+            self.settings.emit()
+        else:
+            super().keyPressEvent(e)
+            return
+        e.accept()
+
+
+# ----------------------------------------------------------------------------
+# Virtualised list (paints only the visible rows -> fast with 100k+ items)
+# + "push" transition: old list slides/fades away, new rows fly in (staggered)
+# ----------------------------------------------------------------------------
+class ItemList(QWidget):
+    activated = pyqtSignal(object)
+    ROW_H = 50
+    PAD = 8
+
+    def __init__(self, theme, accent):
+        super().__init__()
+        self.theme = theme
+        self.accent = accent
+        self.items = []
+        self.sel = -1
+        self.sel_y = float(self.PAD)
+        self.hover = -1
+        self.offset = 0.0
+        self.target = 0.0
+        self.seq = 1.0
+        self.message = ""
+        self._mouse = None
+        self._drag = False
+        self.f_name = mono_font(15)
+        self.f_dim = mono_font(12)
+        self.fm_name = QFontMetrics(self.f_name)
+        self.fm_dim = QFontMetrics(self.f_dim)
+        self.setMouseTracking(True)
+        self.timer = QTimer(self)
+        self.timer.setInterval(16)
+        self.timer.timeout.connect(self._tick)
+
+        # transition state
+        self.tr = 1.0               # 0 -> 1 progress (1 = finished)
+        self.tr_dir = 0             # +1 = going deeper, -1 = going back, 0 = fade only
+        self.snap = None            # picture of the old list
+        self._pending = None        # direction waiting for the next set_items()
+        self.tr_anim = QVariantAnimation(self)
+        self.tr_anim.setDuration(TRANSITION_MS)
+        self.tr_anim.setEasingCurve(QEasingCurve.Type.Linear)
+        self.tr_anim.setStartValue(0.0)
+        self.tr_anim.setEndValue(1.0)
+        self.tr_anim.valueChanged.connect(self._set_tr)
+        self.tr_anim.finished.connect(self._tr_done)
+
+    # --- transition --------------------------------------------------------
+    def begin_transition(self, direction):
+        """Call right BEFORE the content changes; the next set_items() plays the animation."""
+        snap = None
+        try:
+            if self.isVisible() and self.width() > 0 and self.height() > 0:
+                dpr = self.devicePixelRatioF()
+                snap = QPixmap(int(self.width() * dpr), int(self.height() * dpr))
+                snap.setDevicePixelRatio(dpr)
+                snap.fill(Qt.GlobalColor.transparent)
+                # DrawChildren only -> no window background, so the old list keeps the card's colour
+                self.render(snap, QPoint(), QRegion(), QWidget.RenderFlag.DrawChildren)
+        except Exception:
+            snap = None
+        self.snap = snap
+        self._pending = direction
+
+    def _set_tr(self, v):
+        self.tr = float(v)
+        self.update()
+
+    def _tr_done(self):
+        self.tr = 1.0
+        self.snap = None
+        self.update()
+
+    # --- model -------------------------------------------------------------
+    def content_h(self):
+        return len(self.items) * self.ROW_H + 2 * self.PAD
+
+    def max_offset(self):
+        return max(0.0, self.content_h() - self.height())
+
+    def _row_top(self, i):
+        return self.PAD + i * self.ROW_H
+
+    def set_items(self, items):
+        self.items = items
+        self.sel = 0 if items else -1
+        self.sel_y = float(self._row_top(0))
+        self.offset = self.target = 0.0
+        if self._pending is not None:
+            self.tr_dir = self._pending
+            self._pending = None
+            self.tr = 0.0
+            self.tr_anim.stop()
+            self.tr_anim.start()
+        self._update_hover()
+        self.update()
+
+    def current(self):
+        return self.items[self.sel] if 0 <= self.sel < len(self.items) else None
+
+    def select(self, i, ensure=True):
+        if not self.items:
+            return
+        self.sel = int(clamp(i, 0, len(self.items) - 1))
+        if ensure:
+            self.ensure_visible(self.sel)
+        self._start()
+
+    def step(self, step):
+        self.select((self.sel if self.sel >= 0 else -1) + step)
+
+    def ensure_visible(self, i):
+        top, bot = self._row_top(i), self._row_top(i) + self.ROW_H
+        vh = self.height()
+        t = self.target
+        if top - 6 < t:
+            t = top - 6
+        elif bot + 6 > t + vh:
+            t = bot + 6 - vh
+        self.target = clamp(t, 0, self.max_offset())
+
+    # --- animation ---------------------------------------------------------
+    def _start(self):
+        if not self.timer.isActive():
+            self.timer.start()
+
+    def _tick(self):
+        moving = False
+        d = self.target - self.offset
+        if abs(d) > 0.4:
+            self.offset += d * SCROLL_EASE
+            moving = True
+        else:
+            self.offset = self.target
+        ty = float(self._row_top(self.sel)) if self.sel >= 0 else float(self.PAD)
+        dy = ty - self.sel_y
+        if abs(dy) > 0.4:
+            self.sel_y += dy * 0.35
+            moving = True
+        else:
+            self.sel_y = ty
+        if self._mouse is not None:
+            self._update_hover()
+        self.update()
+        if not moving:
+            self.timer.stop()
+
+    def resizeEvent(self, e):
+        mo = self.max_offset()
+        self.target = clamp(self.target, 0, mo)
+        self.offset = clamp(self.offset, 0, mo)
+
+    # --- input -------------------------------------------------------------
+    def _index_at(self, y):
+        i = int((y + self.offset - self.PAD) // self.ROW_H)
+        return i if 0 <= i < len(self.items) else -1
+
+    def _update_hover(self):
+        i = self._index_at(self._mouse.y()) if self._mouse is not None else -1
+        if i != self.hover:
+            self.hover = i
+            self.update()
+
+    def _handle_geom(self):
+        H = self.height()
+        track_top, track_h = 8.0, H - 16.0
+        hh = max(40.0, track_h * H / max(1.0, self.content_h()))
+        return track_top, track_h, hh
+
+    def _drag_to(self, y):
+        track_top, track_h, hh = self._handle_geom()
+        span = max(1.0, track_h - hh)
+        ratio = clamp((y - track_top - hh / 2) / span)
+        self.offset = self.target = ratio * self.max_offset()
+        self.update()
+
+    def wheelEvent(self, e):
+        delta = e.angleDelta().y() or e.pixelDelta().y()
+        self.target = clamp(self.target - delta * SCROLL_SPEED, 0, self.max_offset())
+        self._start()
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        self._mouse = e.position().toPoint()
+        if self._drag:
+            self._drag_to(self._mouse.y())
+        else:
+            self._update_hover()
+
+    def leaveEvent(self, e):
+        self._mouse = None
+        if self.hover != -1:
+            self.hover = -1
+            self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = e.position().toPoint()
+        if self.max_offset() > 0 and pos.x() >= self.width() - 18:
+            self._drag = True
+            self._drag_to(pos.y())
+            return
+        i = self._index_at(pos.y())
+        if i >= 0:
+            self.select(i, ensure=False)
+
+    def mouseReleaseEvent(self, e):
+        self._drag = False
+        self.update()
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            i = self._index_at(e.position().toPoint().y())
+            if i >= 0:
+                self.select(i, ensure=False)
+                self.activated.emit(self.items[i])
+
+    # --- painting ----------------------------------------------------------
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
+                         | QPainter.RenderHint.TextAntialiasing)
+        th = self.theme
+        W, H = self.width(), self.height()
+        n = len(self.items)
+        tr, d = self.tr, self.tr_dir
+        sl = TRANSITION_SLIDE
+
+        # old list sliding + fading away
+        if self.snap is not None and tr < 1.0:
+            so = clamp(tr / 0.5)
+            if so < 1.0:
+                p.save()
+                p.setOpacity(1.0 - so)
+                eo = ease_out_cubic(so)
+                p.drawPixmap(QPointF(-d * eo * sl, (-eo * 8) if d == 0 else 0.0), self.snap)
+                p.restore()
+
+        if n == 0:
+            if self.message:
+                p.setOpacity(ease_out_cubic(clamp((tr - 0.2) / 0.6)))
+                p.setFont(mono_font(14))
+                p.setPen(th.mix(*DIM))
+                p.drawText(QRectF(0, 0, W, H * 0.7), Qt.AlignmentFlag.AlignCenter, self.message)
+            return
+        rh = self.ROW_H
+        x0, x1 = 20.0, W - 24.0
+        off = self.offset
+        tpill = 1.0 if tr >= 1.0 else ease_out_cubic(clamp((tr - 0.12) / 0.5))
+
+        # sliding selection pill
+        if self.sel >= 0:
+            a = ease_out_cubic(clamp((self.seq - 0.22) / 0.35)) * tpill
+            y = self.sel_y - off
+            if a > 0 and -rh < y < H:
+                pill = QRectF(x0 + (1 - tpill) * d * sl, y + 4 + ((1 - tpill) * 14 if d == 0 else 0),
+                              x1 - x0, rh - 8)
+                path = QPainterPath()
+                path.addRoundedRect(pill, pill.height() / 2, pill.height() / 2)
+                p.fillPath(path, with_alpha(self.accent, 255 * a))
+
+        first = max(0, int((off - self.PAD) // rh))
+        last = min(n - 1, int((off + H - self.PAD) // rh))
+        col_text, col_dim = th.mix(*TEXT), th.mix(*DIM)
+        for i in range(first, last + 1):
+            ap = ease_out_cubic(clamp((self.seq - (0.22 + min(i, 14) * 0.035)) / 0.4))
+            if ap <= 0:
+                continue
+            if tr >= 1.0:
+                tp = 1.0
+            else:
+                tp = ease_out_cubic(clamp((tr - 0.12 - min(i - first, 12) * 0.03) / 0.5))
+                if tp <= 0:
+                    continue
+            item = self.items[i]
+            top = self.PAD + i * rh
+            y = top - off
+            r = QRectF(x0, y + 4, x1 - x0, rh - 8)
+            ov = clamp(1 - abs(top - self.sel_y) / rh) * tpill   # how much the pill covers this row
+            p.save()
+            p.setOpacity(ap * tp)
+            p.translate((1 - ap) * 46 + (1 - tp) * d * sl, ((1 - tp) * 14) if d == 0 else 0)
+            if i == self.hover and ov < 0.5:
+                hp = QPainterPath()
+                hp.addRoundedRect(r, r.height() / 2, r.height() / 2)
+                p.fillPath(hp, th.mix(*HOVER))
+
+            icon_rect = QRectF(r.left() + 20, r.center().y() - 14, 28, 28)
+            pm = item_icon(item)
+            if pm is not None:
+                p.drawPixmap(icon_rect, pm, QRectF(pm.rect()))
+            else:
+                draw_fallback_icon(p, item.name if item.kind == "app" else (item.ext[1:] or item.name), icon_rect)
+
+            tx = icon_rect.right() + 14
+            avail = r.right() - tx - 22
+            par = item.parent
+            nw = avail * 0.62 if par else avail
+            p.setFont(self.f_name)
+            p.setPen(lerp_color(col_text, SEL_TEXT, ov))
+            p.drawText(QRectF(tx, r.top(), nw, r.height()),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       self.fm_name.elidedText(item.name, Qt.TextElideMode.ElideRight, int(nw)))
+            if par:
+                dw = avail - nw - 10
+                if dw > 30:
+                    p.setFont(self.f_dim)
+                    dc = lerp_color(col_dim, with_alpha(SEL_TEXT, 150), ov)
+                    p.setPen(dc)
+                    p.drawText(QRectF(tx + nw + 10, r.top(), dw, r.height()),
+                               Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                               self.fm_dim.elidedText(par, Qt.TextElideMode.ElideLeft, int(dw)))
+            p.restore()
+
+        # scrollbar
+        mo = self.max_offset()
+        if mo > 0:
+            track_top, track_h, hh = self._handle_geom()
+            hy = track_top + (off / mo) * (track_h - hh)
+            col = th.mix(*SCROLLC)
+            if self._drag:
+                col.setAlpha(min(255, col.alpha() + 80))
+            p.setOpacity(tpill)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(W - 11, hy, 6, hh), 3, 3)
+
+
+# ----------------------------------------------------------------------------
+# SlideBar: base for the path bar / sort bar.  Opens and closes with a smooth
+# height + fade animation instead of popping in.
+# ----------------------------------------------------------------------------
+class SlideBar(QWidget):
+    H = 40
+
+    def __init__(self):
+        super().__init__()
+        self.vis = 0.0
+        self.want = False
+        self.setFixedHeight(0)
+        self._slide_anim = QVariantAnimation(self)
+        self._slide_anim.setDuration(BAR_SLIDE_MS)
+        self._slide_anim.valueChanged.connect(self._set_vis)
+        self._slide_anim.finished.connect(self._slide_done)
+        QWidget.hide(self)
+
+    def _set_vis(self, v):
+        self.vis = clamp(float(v))
+        self.setFixedHeight(max(0, int(round(self.H * self.vis))))
+        self.update()
+
+    def _slide_done(self):
+        if not self.want:
+            QWidget.hide(self)
+
+    def slide(self, show):
+        was_hidden = (not self.want) or (not self.isVisible())
+        self.want = bool(show)
+        self._slide_anim.stop()
+        self._slide_anim.setStartValue(self.vis)
+        self._slide_anim.setEndValue(1.0 if show else 0.0)
+        self._slide_anim.setEasingCurve(QEasingCurve.Type.OutCubic if show else QEasingCurve.Type.InCubic)
+        if show:
+            self.show()
+            if was_hidden:
+                self.on_show()
+        self._slide_anim.start()
+
+    def on_show(self):
+        pass
+
+    def _enter(self, p):
+        p.setOpacity(clamp(self.vis * 1.6))
+
+
+# ----------------------------------------------------------------------------
+# Sort bar (files mode) - gliding pill, rotating arrow, pop-in chips, bounce
+# ----------------------------------------------------------------------------
+class SortBar(SlideBar):
+    changed = pyqtSignal(str, bool)
+    H = 40
+    CHIPS = (("name", "Name"), ("date", "Modified"), ("size", "Size"), ("type", "Type"))
+    ARROW_SLOT = 14
+
+    def __init__(self, theme, accent):
+        super().__init__()
+        self.theme = theme
+        self.accent = accent
+        self.key = CFG["file_sort"]
+        self.asc = bool(CFG["file_sort_asc"])
+        self.status = ""
+        self.old_status = ""
+        self.st_t = 1.0
+        self.cur = -1                                   # hovered chip
+        n = len(self.CHIPS)
+        self.act = [1.0 if k == self.key else 0.0 for k, _ in self.CHIPS]
+        self.hov = [0.0] * n
+        self.bounce = [0.0] * n
+        self.arrow = 0.0 if self.asc else 180.0         # degrees (0 = up, 180 = down)
+        self.intro = 1.0
+        self.rects = []
+        self.f = mono_font(12)
+        self.fm = QFontMetrics(self.f)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.timer = QTimer(self)
+        self.timer.setInterval(16)
+        self.timer.timeout.connect(self._tick)
+
+    def on_show(self):
+        self.intro = 0.0
+        self._start()
+
+    def _start(self):
+        if not self.timer.isActive():
+            self.timer.start()
+
+    def set_status(self, s):
+        if s == self.status:
+            return
+        self.old_status = self.status
+        self.status = s
+        self.st_t = 0.0
+        self._start()
+
+    def _tick(self):
+        moving = False
+        for i, (k, _) in enumerate(self.CHIPS):
+            ta = 1.0 if k == self.key else 0.0
+            d = ta - self.act[i]
+            if abs(d) > 0.002:
+                self.act[i] += d * 0.2
+                moving = True
+            else:
+                self.act[i] = ta
+            th_ = 1.0 if (i == self.cur and ta == 0.0) else 0.0
+            d = th_ - self.hov[i]
+            if abs(d) > 0.01:
+                self.hov[i] += d * 0.28
+                moving = True
+            else:
+                self.hov[i] = th_
+            if self.bounce[i] > 0.01:
+                self.bounce[i] *= 0.82
+                moving = True
+            else:
+                self.bounce[i] = 0.0
+        ta = 0.0 if self.asc else 180.0
+        d = ta - self.arrow
+        if abs(d) > 0.4:
+            self.arrow += d * 0.22
+            moving = True
+        else:
+            self.arrow = ta
+        if self.intro < 1.0:
+            self.intro = min(1.0, self.intro + 0.032)
+            moving = True
+        if self.st_t < 1.0:
+            self.st_t = min(1.0, self.st_t + 0.07)
+            moving = True
+        self.update()
+        if not moving:
+            self.timer.stop()
+
+    def _layout(self):
+        fm = self.fm
+        x = 26 + fm.horizontalAdvance("SORT") + 14
+        self.rects = []
+        for i, (key, label) in enumerate(self.CHIPS):
+            adv = fm.horizontalAdvance(label)
+            w = adv + 26 + self.ARROW_SLOT * self.act[i]
+            self.rects.append((key, label, adv, QRectF(x, (self.H - 26) / 2, w, 26)))
+            x += w + 6
+
+    def _chip_at(self, pos):
+        self._layout()
+        for i, (_, _, _, r) in enumerate(self.rects):
+            if r.contains(QPointF(pos)):
+                return i
+        return -1
+
+    def mouseMoveEvent(self, e):
+        i = self._chip_at(e.position())
+        if i != self.cur:
+            self.cur = i
+            self._start()
+
+    def leaveEvent(self, e):
+        self.cur = -1
+        self._start()
+
+    def mousePressEvent(self, e):
+        i = self._chip_at(e.position())
+        if i < 0 or e.button() != Qt.MouseButton.LeftButton:
+            return
+        key = self.rects[i][0]
+        self.bounce[i] = 1.0
+        if key == self.key:
+            self.asc = not self.asc
+        else:
+            self.key = key
+            self.asc = key in ("name", "type")
+        self._start()
+        self.changed.emit(self.key, self.asc)
+        e.accept()
+
+    def _draw_arrow(self, p, c, deg, scale, color):
+        p.save()
+        p.translate(c)
+        p.rotate(deg)
+        p.scale(scale, scale)
+        p.setPen(QPen(color, 1.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(QPointF(0, 4.2), QPointF(0, -4.2))
+        p.drawPolyline(QPolygonF([QPointF(-3.2, -1.2), QPointF(0, -4.4), QPointF(3.2, -1.2)]))
+        p.restore()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        self._enter(p)
+        base_op = p.opacity()
+        th = self.theme
+        self._layout()
+        p.setFont(self.f)
+        dim = th.mix(*DIM)
+        txt_col = th.mix(*TEXT)
+
+        p.setPen(dim)
+        p.drawText(QRectF(26, 0, 80, self.H), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "SORT")
+
+        # per-chip intro (pop in one by one)
+        ips = [ease_out_back(clamp((self.intro - i * 0.1) / 0.6)) for i in range(len(self.CHIPS))]
+
+        # inactive chip backgrounds
+        for i, (key, label, adv, r) in enumerate(self.rects):
+            ip = ips[i]
+            if ip <= 0:
+                continue
+            c = th.mix(*CHIP)
+            c.setAlpha(min(255, int(c.alpha() + 40 * self.hov[i])))
+            p.save()
+            p.setOpacity(base_op * clamp(ip * 1.6) * (1 - self.act[i]))
+            cc = r.center()
+            s = max(0.0, ip) * (1 - 0.10 * self.bounce[i]) * (1 + 0.04 * self.hov[i])
+            p.translate(cc)
+            p.scale(s, s)
+            p.translate(-cc)
+            path = QPainterPath()
+            path.addRoundedRect(r, 13, 13)
+            p.fillPath(path, c)
+            p.restore()
+
+        # the accent pill glides between chips (weighted by how "active" each chip is)
+        s_act = sum(self.act) or 1.0
+        px = sum(self.act[i] * self.rects[i][3].x() for i in range(len(self.rects))) / s_act
+        pw = sum(self.act[i] * self.rects[i][3].width() for i in range(len(self.rects))) / s_act
+        ip_pill = sum(self.act[i] * ips[i] for i in range(len(self.rects))) / s_act
+        bnc = sum(self.act[i] * self.bounce[i] for i in range(len(self.rects))) / s_act
+        if ip_pill > 0:
+            pr = QRectF(px, (self.H - 26) / 2, pw, 26)
+            p.save()
+            p.setOpacity(base_op * clamp(ip_pill * 1.6))
+            cc = pr.center()
+            s = max(0.0, ip_pill) * (1 - 0.10 * bnc)
+            p.translate(cc)
+            p.scale(s, s)
+            p.translate(-cc)
+            path = QPainterPath()
+            path.addRoundedRect(pr, 13, 13)
+            p.fillPath(path, self.accent)
+            p.restore()
+
+        # labels + arrow
+        for i, (key, label, adv, r) in enumerate(self.rects):
+            ip = ips[i]
+            if ip <= 0:
+                continue
+            a = self.act[i]
+            p.save()
+            p.setOpacity(base_op * clamp(ip * 1.6))
+            cc = r.center()
+            s = max(0.0, ip) * (1 - 0.10 * self.bounce[i])
+            p.translate(cc)
+            p.scale(s, s)
+            p.translate(-cc)
+            col = lerp_color(txt_col, SEL_TEXT, a)
+            p.setPen(col)
+            p.drawText(QRectF(r.left() + 13, r.top(), adv + 4, r.height()),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+            if a > 0.03:
+                ac = QPointF(r.left() + 13 + adv + 10, r.center().y())
+                self._draw_arrow(p, ac, self.arrow, a, with_alpha(SEL_TEXT, 255 * a))
+            p.restore()
+
+        # status text: old slides up + fades, new slides in from below
+        p.setFont(self.f)
+        tr = QRectF(self.width() - 230, 0, 204, self.H)
+        al = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        t = ease_out_cubic(self.st_t)
+        if self.st_t < 1.0 and self.old_status:
+            p.save()
+            p.setOpacity(base_op * (1 - clamp(self.st_t * 2.2)))
+            p.setPen(dim)
+            p.drawText(tr.translated(0, -8 * t), al, self.old_status)
+            p.restore()
+        p.save()
+        p.setOpacity(base_op * clamp(self.st_t * 2.0))
+        p.setPen(dim)
+        p.drawText(tr.translated(0, 8 * (1 - t)), al, self.status)
+        p.restore()
+
+
+# ----------------------------------------------------------------------------
+# Path bar (shown while you are inside a folder): ">" exit button + current path
+# The path is "typed" out with a caret; the button ripples on every folder change.
+# ----------------------------------------------------------------------------
+class PathBar(SlideBar):
+    exit = pyqtSignal()
+    H = 44
+
+    def __init__(self, theme, accent):
+        super().__init__()
+        self.theme = theme
+        self.accent = accent
+        self.path = ""
+        self.old = ""
+        self.dir = 1
+        self.t = 1.0
+        self.hov = False
+        self._down = False
+        self.setMouseTracking(True)
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(PATH_TYPE_MS)
+        self.anim.setEasingCurve(QEasingCurve.Type.Linear)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.valueChanged.connect(self._set_t)
+        self.anim.finished.connect(self._done)
+
+    def _set_t(self, v):
+        self.t = float(v)
+        self.update()
+
+    def _done(self):
+        self.t = 1.0
+        self.old = ""
+        self.update()
+
+    def _play(self):
+        self.t = 0.0
+        self.anim.stop()
+        self.anim.start()
+
+    def on_show(self):
+        self.old = ""
+        self.dir = 1
+        self._play()
+
+    def _btn(self):
+        return QRectF(26, (self.H - 30) / 2, 30, 30)
+
+    def set_path(self, p, direction=1):
+        disp = ("~" + p[len(HOME):]) if p.startswith(HOME) else p
+        if disp == self.path:
+            return
+        self.old = self.path
+        self.path = disp
+        self.dir = direction
+        self._play()
+
+    def mouseMoveEvent(self, e):
+        h = self._btn().contains(e.position())
+        if h != self.hov:
+            self.hov = h
+            self.setCursor(Qt.CursorShape.PointingHandCursor if h else Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def leaveEvent(self, e):
+        self.hov = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._btn().contains(e.position()):
+            self._down = True
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        was, self._down = self._down, False
+        if was and self._btn().contains(e.position()):
+            self.exit.emit()
+        e.accept()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        self._enter(p)
+        base_op = p.opacity()
+        th = self.theme
+        t = self.t
+        te = ease_out_cubic(t)
+        d = self.dir
+
+        # ---- exit button (ripple ring + bump + arrow nudge) ----
+        r = self._btn()
+        c = r.center()
+        if t < 1.0:
+            rr = 15 + 6 * te
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(with_alpha(self.accent, 190 * (1 - te)), 2.0))
+            p.drawEllipse(c, rr, rr)
+        p.save()
+        p.translate(c)
+        s = (1.08 if self.hov else 1.0) * (1 + 0.12 * math.sin(math.pi * t))
+        p.scale(s, s)
+        p.translate(-c)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self.accent)
+        p.drawEllipse(r)
+        nud = math.sin(math.pi * t) * 3.2 * d
+        p.setPen(QPen(SEL_TEXT, 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.drawPolyline(QPolygonF([QPointF(c.x() - 2.5 + nud, c.y() - 5.5), QPointF(c.x() + 3 + nud, c.y()),
+                                  QPointF(c.x() - 2.5 + nud, c.y() + 5.5)]))
+        p.restore()
+
+        # ---- path text ----
+        f = mono_font(13)
+        fm = QFontMetrics(f)
+        p.setFont(f)
+        w = self.width() - 70 - 26
+        box = QRectF(70, 0, w, self.H)
+        al = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        col = th.mix(*TEXT)
+
+        # old text slides away and fades
+        if self.old and t < 1.0:
+            oa = 1 - clamp(t * 2.4)
+            if oa > 0:
+                p.save()
+                p.setClipRect(box)
+                p.setOpacity(base_op * oa)
+                p.setPen(col)
+                p.drawText(box.translated(-d * te * 36, 0), al,
+                           fm.elidedText(self.old, Qt.TextElideMode.ElideLeft, int(w)))
+                p.restore()
+
+        # new text is typed in, left -> right, sliding in a little
+        txt = fm.elidedText(self.path, Qt.TextElideMode.ElideLeft, int(w))
+        tw = fm.horizontalAdvance(txt)
+        dx = (1 - te) * d * 24
+        p.save()
+        p.setOpacity(base_op * clamp(t * 3.0))
+        if t < 1.0:
+            p.setClipRect(QRectF(70, 0, tw * te + 3, self.H))
+        p.setPen(col)
+        p.drawText(box.translated(dx, 0), al, txt)
+        p.restore()
+
+        # caret at the typing edge
+        if t < 1.0:
+            ca = clamp((1 - t) * 2.2)
+            cx = 70 + dx + tw * te + 2
+            p.setOpacity(base_op * ca)
+            p.setPen(QPen(self.accent, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(QPointF(cx, self.H / 2 - 9), QPointF(cx, self.H / 2 + 9))
+
+
+# ----------------------------------------------------------------------------
+# Settings panel (slides up over the list; banner above updates live)
+# ----------------------------------------------------------------------------
+class ColorDot(QWidget):
+    clicked = pyqtSignal(str)
+
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+        self.hov = False
+        self.setFixedSize(26, 26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def enterEvent(self, e):
+        self.hov = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self.hov = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._down = True
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        was = getattr(self, "_down", False)
+        self._down = False
+        if was and e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.value)
+        e.accept()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(3, 3, 20, 20)
+        if self.value == "auto":
+            g = QConicalGradient(r.center(), 0)
+            for i, c in enumerate(("#ff6b6b", "#ffd93d", "#6bff95", "#4dd8ff", "#b58bff", "#ff6b6b")):
+                g.setColorAt(i / 5.0, QColor(c))
+            p.setBrush(g)
+        else:
+            p.setBrush(QColor(self.value))
+        p.setPen(QPen(QColor(255, 255, 255, 230 if self.hov else 70), 1.8))
+        p.drawEllipse(r)
+
+
+class SettingsPanel(QWidget):
+    closed = pyqtSignal()
+    changed = pyqtSignal(object)
+    W = CARD_W - 28
+    H = CARD_H - HEADER_H - 22
+    SWATCHES = ("#a8f5ea", "#ffb3d1", "#c9b8ff", "#ffcfa3", "#a3d8ff", "#d4f5a8", "auto")
+
+    def __init__(self, card, accent):
+        super().__init__(card)
+        self.accent = QColor(accent)
+        self.closing = False
+        self._loading = False
+        self.base_y = HEADER_H + 8
+        self.setFixedSize(self.W, self.H)
+        self.setFont(mono_font(12))
+        self.move(14, CARD_H)
+        self.hide()
+
+        self.debounce = QTimer(self)
+        self.debounce.setSingleShot(True)
+        self.debounce.setInterval(380)
+        self.debounce.timeout.connect(self._apply_live)
+
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(520)
+        self.anim.valueChanged.connect(self._slide)
+        self.anim.finished.connect(self._anim_done)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 14, 22, 16)
+        root.setSpacing(7)
+
+        # title
+        tr = QHBoxLayout()
+        title = QLabel("Settings")
+        title.setObjectName("title")
+        sub = QLabel("changes apply live")
+        sub.setObjectName("sub")
+        close = QPushButton("\u2715")
+        close.setObjectName("close")
+        close.setFixedSize(28, 28)
+        close.clicked.connect(self.close_anim)
+        tr.addWidget(title)
+        tr.addWidget(sub)
+        tr.addStretch(1)
+        tr.addWidget(close)
+        root.addLayout(tr)
+
+        # paths
+        self.banner_edit = QLineEdit()
+        self.banner_edit.setPlaceholderText("Paste banner image path\u2026  (png / jpg / webp)")
+        root.addLayout(self._path_row("Banner", self.banner_edit))
+        self.bg_edit = QLineEdit()
+        self.bg_edit.setPlaceholderText("Background image path  (empty = your wallpaper)")
+        root.addLayout(self._path_row("Background", self.bg_edit))
+
+        # sliders
+        self.blur = self._slider(0, 60)
+        self.focus = self._slider(0, 100)
+        self.tilt = self._slider(0, 45)
+        self.dim = self._slider(0, 200)
+        root.addLayout(self._slider_pair("Blur", self.blur, "Focus", self.focus))
+        root.addLayout(self._slider_pair("Tilt", self.tilt, "Dim", self.dim))
+
+        # accent
+        ar = QHBoxLayout()
+        ar.setSpacing(6)
+        lab = QLabel("Accent")
+        lab.setFixedWidth(78)
+        ar.addWidget(lab)
+        for v in self.SWATCHES:
+            d = ColorDot(v)
+            d.clicked.connect(lambda val: self.accent_edit.setText(val))
+            ar.addWidget(d)
+        ar.addSpacing(6)
+        self.accent_edit = QLineEdit()
+        self.accent_edit.setPlaceholderText("#a8f5ea  or  auto")
+        self.accent_edit.setFixedHeight(32)
+        ar.addWidget(self.accent_edit, 1)
+        root.addLayout(ar)
+
+        # folders
+        fr = QHBoxLayout()
+        fr.setSpacing(8)
+        lab = QLabel("Folders")
+        lab.setFixedWidth(78)
+        self.folders_edit = QLineEdit()
+        self.folders_edit.setPlaceholderText("Extra folders for FILES mode, separated by  ;   (e.g. D:\\Games;E:\\Media)")
+        self.folders_edit.setFixedHeight(32)
+        fr.addWidget(lab)
+        fr.addWidget(self.folders_edit, 1)
+        root.addLayout(fr)
+
+        root.addStretch(1)
+
+        # bottom
+        br = QHBoxLayout()
+        self.status = QLabel("")
+        self.status.setObjectName("sub")
+        reset = QPushButton("Reset")
+        reset.setFixedHeight(32)
+        reset.clicked.connect(self._reset)
+        done = QPushButton("Done")
+        done.setObjectName("primary")
+        done.setFixedHeight(32)
+        done.setFixedWidth(90)
+        done.clicked.connect(self.close_anim)
+        br.addWidget(self.status, 1)
+        br.addWidget(reset)
+        br.addWidget(done)
+        root.addLayout(br)
+
+        for w in (self.banner_edit, self.bg_edit, self.accent_edit, self.folders_edit):
+            w.textChanged.connect(self._queue)
+        for w in (self.blur, self.focus, self.tilt, self.dim):
+            w.valueChanged.connect(self._queue)
+        self.banner_edit.textChanged.connect(lambda: self._mark(self.banner_edit))
+        self.bg_edit.textChanged.connect(lambda: self._mark(self.bg_edit))
+        self.restyle(accent)
+
+    # --- ui helpers --------------------------------------------------------
+    def _path_row(self, name, edit):
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        lab = QLabel(name)
+        lab.setFixedWidth(78)
+        edit.setFixedHeight(32)
+        bp = QPushButton("Paste")
+        bp.setFixedHeight(32)
+        bp.clicked.connect(lambda: edit.setText(clean_path(QApplication.clipboard().text())))
+        bb = QPushButton("Browse")
+        bb.setFixedHeight(32)
+        bb.clicked.connect(lambda: self._browse(edit))
+        row.addWidget(lab)
+        row.addWidget(edit, 1)
+        row.addWidget(bp)
+        row.addWidget(bb)
+        return row
+
+    @staticmethod
+    def _slider(lo, hi):
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(lo, hi)
+        s.setFixedHeight(24)
+        return s
+
+    def _slider_pair(self, na, sa, nb, sb):
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        for name, s, lw in ((na, sa, 78), (nb, sb, 46)):
+            lab = QLabel(name)
+            lab.setFixedWidth(lw)
+            val = QLabel("0")
+            val.setFixedWidth(30)
+            val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            s.valueChanged.connect(lambda v, l=val: l.setText(str(v)))
+            row.addWidget(lab)
+            row.addWidget(s, 1)
+            row.addWidget(val)
+        return row
+
+    def restyle(self, accent):
+        self.accent = QColor(accent)
+        a = f"{self.accent.red()},{self.accent.green()},{self.accent.blue()}"
+        self.setStyleSheet(f"""
+            QLabel{{color:rgba(225,245,242,0.80);background:transparent;font-size:12px;}}
+            QLabel#title{{color:white;font-size:17px;font-weight:700;}}
+            QLabel#sub{{color:rgba(225,245,242,0.45);font-size:11px;padding-left:8px;}}
+            QLineEdit{{background:rgba(255,255,255,0.07);border:1.5px solid rgba(255,255,255,0.12);
+                      border-radius:16px;padding:0 14px;color:white;font-size:12px;
+                      selection-background-color:rgba({a},0.7);selection-color:black;}}
+            QLineEdit:focus{{border:1.5px solid rgba({a},0.95);}}
+            QPushButton{{background:rgba(255,255,255,0.10);border:none;border-radius:16px;
+                        color:white;padding:0 16px;font-size:12px;}}
+            QPushButton:hover{{background:rgba(255,255,255,0.20);}}
+            QPushButton#primary{{background:rgb({a});color:#04201d;font-weight:700;}}
+            QPushButton#primary:hover{{background:rgba({a},0.85);}}
+            QPushButton#close{{padding:0;border-radius:14px;}}
+            QSlider::groove:horizontal{{height:6px;border-radius:3px;background:rgba(255,255,255,0.14);}}
+            QSlider::sub-page:horizontal{{background:rgb({a});border-radius:3px;}}
+            QSlider::handle:horizontal{{width:16px;height:16px;margin:-5px 0;border-radius:8px;background:white;}}
+        """)
+        self._mark(self.banner_edit)
+        self._mark(self.bg_edit)
+        self.update()
+
+    def _mark(self, edit):
+        t = clean_path(edit.text())
+        if not t:
+            col = "rgba(255,255,255,0.12)"
+        elif valid_image(t):
+            col = f"rgba({self.accent.red()},{self.accent.green()},{self.accent.blue()},0.9)"
+        else:
+            col = "rgba(255,110,110,0.95)"
+        edit.setStyleSheet(f"QLineEdit{{border:1.5px solid {col};}}")
+
+    def _browse(self, edit):
+        start = os.path.dirname(resolve_path(edit.text())) if edit.text().strip() else str(Path.home() / "Pictures")
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                QApplication.activeWindow(), "Choose an image", start,
+                "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;All files (*)")
+        except Exception:
+            path = ""
+        if path:
+            edit.setText(os.path.normpath(path))
+
+    # --- values ------------------------------------------------------------
+    def refresh_from_cfg(self):
+        self._loading = True
+        self.banner_edit.setText(CFG["banner_image"])
+        self.bg_edit.setText(CFG["background_image"])
+        self.blur.setValue(int(CFG["background_blur"]))
+        self.focus.setValue(int(round(float(CFG["banner_focus_y"]) * 100)))
+        self.tilt.setValue(int(round(float(CFG["max_tilt"]))))
+        self.dim.setValue(int(CFG["background_dim"]))
+        self.accent_edit.setText(str(CFG["accent"]))
+        self.folders_edit.setText("; ".join(CFG["extra_roots"]))
+        self._mark(self.banner_edit)
+        self._mark(self.bg_edit)
+        self._loading = False
+
+    def _queue(self, *_):
+        if not self._loading:
+            self.status.setText("\u2026")
+            self.debounce.start()
+
+    def _apply_live(self):
+        changed = set()
+
+        def put(key, val, tag):
+            if CFG.get(key) != val:
+                CFG[key] = val
+                changed.add(tag)
+
+        bi = clean_path(self.banner_edit.text())
+        if not bi or valid_image(bi):
+            put("banner_image", bi, "banner")
+        bg = clean_path(self.bg_edit.text())
+        if not bg or valid_image(bg):
+            put("background_image", bg, "bg")
+        put("banner_focus_y", round(self.focus.value() / 100.0, 2), "banner")
+        put("background_blur", self.blur.value(), "bg")
+        put("background_dim", self.dim.value(), "bg")
+        put("max_tilt", float(self.tilt.value()), "tilt")
+        ac = self.accent_edit.text().strip()
+        if ac.lower() == "auto" or (ac and QColor(ac).isValid()):
+            put("accent", ac, "accent")
+        roots = [s.strip().strip('"') for s in self.folders_edit.text().split(";") if s.strip()]
+        put("extra_roots", roots, "roots")
+        bad = (bi and not valid_image(bi)) or (bg and not valid_image(bg))
+        if changed:
+            save_config()
+            self.changed.emit(changed)
+        self.status.setText("\u2717 image not found" if bad else ("\u2713 applied" if changed else "\u2713 saved"))
+
+    def _reset(self):
+        for k in ("banner_image", "background_image", "background_blur", "background_dim",
+                  "banner_focus_y", "accent", "max_tilt", "extra_roots"):
+            CFG[k] = list(DEFAULT_CFG[k]) if isinstance(DEFAULT_CFG[k], list) else DEFAULT_CFG[k]
+        save_config()
+        self.refresh_from_cfg()
+        self.changed.emit({"banner", "bg", "accent", "tilt", "roots"})
+        self.status.setText("\u2713 reset to defaults")
+
+    # --- open / close ------------------------------------------------------
+    def _slide(self, v):
+        self.move(14, int(self.base_y + (1 - float(v)) * (self.H + 30)))
+
+    def _anim_done(self):
+        if self.closing:
+            self.hide()
+            self.closed.emit()
+
+    def is_open(self):
+        return self.isVisible() and not self.closing
+
+    def open_anim(self):
+        if self.is_open():
+            return
+        self.refresh_from_cfg()
+        self.status.setText("")
+        self.closing = False
+        self.anim.stop()
+        c = QEasingCurve(QEasingCurve.Type.OutBack)
+        c.setOvershoot(1.15)
+        self.anim.setEasingCurve(c)
+        self.anim.setDuration(560)
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.move(14, CARD_H)
+        self.show()
+        self.raise_()
+        self.anim.start()
+
+    def close_anim(self):
+        if not self.isVisible() or self.closing:
+            return
+        self._apply_live() if self.debounce.isActive() else None
+        self.debounce.stop()
+        self.closing = True
+        self.anim.stop()
+        self.anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self.anim.setDuration(260)
+        self.anim.setStartValue(1.0)
+        self.anim.setEndValue(0.0)
+        self.anim.start()
+
+    def toggle(self):
+        if self.is_open():
+            self.close_anim()
+        else:
+            self.open_anim()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.close_anim()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        path = QPainterPath()
+        path.addRoundedRect(r, 24, 24)
+        g = QLinearGradient(r.topLeft(), r.bottomLeft())
+        g.setColorAt(0, QColor(20, 30, 32, 250))
+        g.setColorAt(1, QColor(8, 14, 15, 252))
+        p.fillPath(path, g)
+        p.setPen(QPen(QColor(255, 255, 255, 36), 1.2))
+        p.drawPath(path)
+        p.setPen(QPen(with_alpha(self.accent, 170), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(QPointF(34, 1.6), QPointF(r.width() - 34, 1.6))
+
+
+# ----------------------------------------------------------------------------
+# The card: banner + search + buttons + list
+# ----------------------------------------------------------------------------
+def search_qss(ac):
+    return f"""
+        QLineEdit{{background:rgba(14,16,18,0.50);border:1.5px solid rgba(255,255,255,0.0);
+                  border-radius:22px;padding:0 20px;color:rgb(235,248,245);
+                  placeholder-text-color:rgba(235,248,245,0.55);
+                  selection-background-color:rgba({ac.red()},{ac.green()},{ac.blue()},170);
+                  selection-color:black;}}
+        QLineEdit:focus{{background:rgba(14,16,18,0.62);
+                        border:1.5px solid rgba({ac.red()},{ac.green()},{ac.blue()},0.75);}}
+    """
+
+
+class Card(QWidget):
+    launched = pyqtSignal()
+    closed = pyqtSignal()
+    bg_changed = pyqtSignal()
+
+    def __init__(self, apps, banner, accent):
+        super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(CARD_W, CARD_H)
+        self.banner = banner
+        self.accent = accent
+        self.apps = apps
+        self.theme = Theme(CFG["dark"])
+        self.seq = 0.0
+        self.mode = "apps"
+        self.files = []
+        self.files_sorted = []
+        self.index_state = "idle"          # idle | loading | ready
+        self.index_count = 0
+        self.indexer = None
+        self._old_indexers = []
+        self.nav_stack = []                # folders you have clicked into (empty = the full file list)
+        self.dir_items = []
+        self.dir_sorted = []
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 12)
+        lay.setSpacing(0)
+
+        # ---- header ----
+        header = QWidget()
+        header.setFixedHeight(HEADER_H)
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(30, 0, 30, 0)
+        hl.setSpacing(-2)
+
+        self.btn_search = RoundButton("search", accent)
+        self.btn_search.clicked.connect(lambda: self.search.setFocus())
+        hl.addWidget(self.btn_search)
+        hl.addSpacing(8)
+
+        self.search = SearchEdit()
+        self.search.setFont(mono_font(15))
+        self.search.setPlaceholderText("Search apps")
+        self.search.setFixedSize(270, 44)
+        self.search.setStyleSheet(search_qss(accent))
+        hl.addWidget(self.search)
+        hl.addStretch(1)
+
+        self.btn_theme = RoundButton("moon" if CFG["dark"] else "sun", accent, look="theme")
+        self.btn_theme.setToolTip("Dark / light mode")
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        self.btn_files = RoundButton("term", accent)
+        self.btn_files.setToolTip("Files")
+        self.btn_files.clicked.connect(lambda: self.set_mode("apps" if self.mode == "files" else "files"))
+        self.btn_apps = RoundButton("window", accent)
+        self.btn_apps.setToolTip("Apps")
+        self.btn_apps.clicked.connect(lambda: self.set_mode("apps"))
+        self.btn_gear = RoundButton("gear", accent)
+        self.btn_gear.setToolTip("Settings")
+        self.btn_gear.clicked.connect(lambda: self.settings.toggle())
+        for b in (self.btn_theme, self.btn_files, self.btn_apps, self.btn_gear):
+            hl.addWidget(b)
+        self.buttons = [self.btn_search, self.btn_theme, self.btn_files, self.btn_apps, self.btn_gear]
+        self.btn_apps.set_active(True)
+        lay.addWidget(header)
+
+        # ---- path bar + sort bar + list ----
+        self.pathbar = PathBar(self.theme, accent)
+        self.pathbar.exit.connect(self.exit_folder)
+        lay.addWidget(self.pathbar)
+
+        self.sortbar = SortBar(self.theme, accent)
+        self.sortbar.changed.connect(self._sort_changed)
+        lay.addWidget(self.sortbar)
+
+        self.list = ItemList(self.theme, accent)
+        self.list.activated.connect(self.launch_item)
+        lay.addWidget(self.list, 1)
+
+        # ---- settings ----
+        self.settings = SettingsPanel(self, accent)
+        self.settings.changed.connect(self.apply_settings)
+        self.settings.closed.connect(lambda: self.search.setFocus())
+
+        # ---- banner change animation ----
+        self.old_banner = None
+        self.bt = 1.0
+        self._banner_key = CFG["banner_image"]
+        self.banner_anim = QVariantAnimation(self)
+        self.banner_anim.setDuration(950)
+        self.banner_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self.banner_anim.setStartValue(0.0)
+        self.banner_anim.setEndValue(1.0)
+        self.banner_anim.valueChanged.connect(self._set_bt)
+        self.banner_anim.finished.connect(self._banner_done)
+
+        # ---- theme animation ----
+        self.theme_anim = QVariantAnimation(self)
+        self.theme_anim.setDuration(380)
+        self.theme_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self.theme_anim.valueChanged.connect(self._set_theme)
+
+        self.search.textChanged.connect(lambda _: self.apply_filter())
+        self.search.activated.connect(self.on_enter)
+        self.search.reveal.connect(self.on_reveal)
+        self.search.nav.connect(self.list.step)
+        self.search.escaped.connect(self.closed.emit)
+        self.search.tab.connect(self.cycle_mode)
+        self.search.settings.connect(lambda: self.settings.toggle())
+
+        self.apply_filter()
+        self.set_seq(0.0)
+
+    # --- intro sequence ----------------------------------------------------
+    def set_seq(self, v):
+        self.seq = v
+        self.list.seq = v
+        self.list.update()
+        for i, b in enumerate(self.buttons):
+            b.set_pop(ease_out_back(clamp((v - 0.12 - i * 0.07) / 0.4)))
+        self.update()
+
+    # --- theme / accent ----------------------------------------------------
+    def toggle_theme(self):
+        dark = not CFG["dark"]
+        CFG["dark"] = dark
+        save_config()
+        self.btn_theme.set_kind("moon" if dark else "sun")
+        self.theme_anim.stop()
+        self.theme_anim.setStartValue(self.theme.t)
+        self.theme_anim.setEndValue(0.0 if dark else 1.0)
+        self.theme_anim.start()
+        self.search.setFocus()
+
+    def _set_theme(self, v):
+        self.theme.t = float(v)
+        self.update()
+        self.list.update()
+        self.sortbar.update()
+        self.pathbar.update()
+
+    def set_accent(self, c):
+        self.accent = c
+        for b in self.buttons:
+            b.set_accent(c)
+        self.list.accent = c
+        self.sortbar.accent = c
+        self.pathbar.accent = c
+        self.search.setStyleSheet(search_qss(c))
+        self.settings.restyle(c)
+        self.list.update()
+        self.sortbar.update()
+        self.pathbar.update()
+        self.update()
+
+    # --- banner change animation -------------------------------------------
+    def _set_bt(self, v):
+        self.bt = float(v)
+        self.update(0, 0, CARD_W, HEADER_H)
+
+    def _banner_done(self):
+        self.old_banner = None
+        self.bt = 1.0
+        self.update()
+
+    def set_banner(self, pm, animate):
+        if animate and self.banner is not None:
+            self.old_banner = self.banner
+            self.banner = pm
+            self.bt = 0.0
+            self.banner_anim.stop()
+            self.banner_anim.start()
+        else:
+            self.banner = pm
+            self.old_banner = None
+            self.bt = 1.0
+            self.update()
+
+    def _paint_banner(self, p, hr):
+        old, t = self.old_banner, self.bt
+        if old is None or t >= 1.0:
+            p.drawPixmap(hr.toRect(), self.banner)
+            return
+        c = hr.center()
+        # old picture drifts away and dims
+        p.save()
+        p.translate(c)
+        s = 1 + 0.05 * t
+        p.scale(s, s)
+        p.translate(-c)
+        p.drawPixmap(hr.toRect(), old)
+        p.restore()
+        p.fillRect(hr, QColor(0, 0, 0, int(70 * t)))
+        # new picture slides in behind a slanted, glowing wipe edge and zooms down into place
+        slant = 120.0
+        x = -slant + t * (CARD_W + 2 * slant)
+        a, b = QPointF(x + slant, 0), QPointF(x - slant, HEADER_H)
+        path = QPainterPath()
+        path.addPolygon(QPolygonF([QPointF(0, 0), a, b, QPointF(0, HEADER_H)]))
+        path.closeSubpath()
+        p.save()
+        p.setClipPath(path, Qt.ClipOperation.IntersectClip)
+        p.translate(c)
+        s = 1 + 0.2 * (1 - t)
+        p.scale(s, s)
+        p.translate(-c)
+        p.drawPixmap(hr.toRect(), self.banner)
+        p.restore()
+        fade = math.sin(math.pi * t)
+        for col, w, al in ((self.accent, 18, 40), (self.accent, 9, 95), (QColor(255, 255, 255), 3, 240)):
+            p.setPen(QPen(with_alpha(col, al * fade), w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(a, b)
+        p.fillRect(hr, QColor(255, 255, 255, int(45 * fade)))
+
+    def apply_settings(self, changed):
+        if "banner" in changed:
+            key = CFG["banner_image"]
+            self.set_banner(build_banner(), key != self._banner_key)    # animate only when the picture changes
+            self._banner_key = key
+        if "accent" in changed or ("banner" in changed and str(CFG["accent"]).lower() == "auto"):
+            self.set_accent(resolve_accent(self.banner))
+        if "bg" in changed:
+            self.bg_changed.emit()
+        if "roots" in changed and self.index_state != "idle":
+            self.start_indexing()
+
+    # --- modes -------------------------------------------------------------
+    def set_mode(self, m):
+        if m != self.mode:
+            self.list.begin_transition(1 if m == "files" else -1)
+        self.mode = m
+        self.btn_files.set_active(m == "files")
+        self.btn_apps.set_active(m == "apps")
+        self.sortbar.slide(m == "files")
+        self.pathbar.slide(m == "files" and bool(self.nav_stack))
+        self.search.setPlaceholderText("Search files" if m == "files" else "Search apps")
+        if m == "files" and self.index_state == "idle":
+            self.start_indexing()
+        self.apply_filter()
+        self.search.setFocus()
+
+    def cycle_mode(self):
+        self.set_mode("files" if self.mode == "apps" else "apps")
+
+    # --- file index --------------------------------------------------------
+    def start_indexing(self):
+        roots = [HOME] + [resolve_path(r) for r in CFG["extra_roots"] if os.path.isdir(resolve_path(r))]
+        if self.indexer is not None:
+            self.indexer.stop()
+            self._old_indexers.append(self.indexer)
+        self.index_state = "loading"
+        self.index_count = 0
+        self.indexer = FileIndexer(roots)
+        self.indexer.loaded.connect(self._files_loaded)
+        self.indexer.done.connect(self._files_done)
+        self.indexer.progress.connect(self._files_progress)
+        self.indexer.start()
+
+    def _files_loaded(self, items):
+        if self.index_state != "ready" and not self.files:
+            self.files = items
+            self._resort()
+            if self.mode == "files":
+                self.apply_filter()
+
+    def _files_done(self, items):
+        self.files = items
+        self.index_state = "ready"
+        self._resort()
+        if self.mode == "files":
+            self.apply_filter()
+
+    def _files_progress(self, n):
+        self.index_count = n
+        if self.mode == "files" and not self.files_sorted:
+            self.sortbar.set_status(f"indexing\u2026 {n:,}")
+
+    def _sort_getter(self):
+        return {"name": attrgetter("name_l"), "date": attrgetter("mtime"),
+                "size": attrgetter("size"), "type": attrgetter("ext", "name_l")}[CFG["file_sort"]]
+
+    def _resort(self):
+        self.files_sorted = sorted(self.files, key=self._sort_getter(), reverse=not CFG["file_sort_asc"])
+        if self.nav_stack:
+            self._resort_dir()
+
+    def _resort_dir(self):
+        g, rev = self._sort_getter(), not CFG["file_sort_asc"]
+        dirs = sorted([i for i in self.dir_items if i.is_dir], key=g, reverse=rev)
+        files = sorted([i for i in self.dir_items if not i.is_dir], key=g, reverse=rev)
+        self.dir_sorted = dirs + files          # folders first
+
+    # --- folders -----------------------------------------------------------
+    def _show_folder(self, direction=1):
+        path = self.nav_stack[-1]
+        self.dir_items = list_dir(path)
+        self._resort_dir()
+        self.pathbar.set_path(path, direction)
+        self.pathbar.slide(True)
+        self.search.blockSignals(True)
+        self.search.setText("")
+        self.search.blockSignals(False)
+        self.apply_filter()
+
+    def enter_folder(self, path):
+        self.list.begin_transition(1)               # old list slides left, new rows fly in from the right
+        self.nav_stack.append(path)
+        self._show_folder(1)
+
+    def exit_folder(self):
+        if not self.nav_stack:
+            return
+        self.list.begin_transition(-1)              # mirror of entering
+        self.nav_stack.pop()
+        if self.nav_stack:
+            self._show_folder(-1)
+        else:
+            self.pathbar.slide(False)
+            self.search.blockSignals(True)
+            self.search.setText("")
+            self.search.blockSignals(False)
+            self.apply_filter()
+        self.search.setFocus()
+
+    def _sort_changed(self, key, asc):
+        CFG["file_sort"], CFG["file_sort_asc"] = key, asc
+        save_config()
+        self._resort()
+        self.list.begin_transition(0)               # rows fade / drop in again in the new order
+        self.apply_filter()
+
+    def shutdown(self):
+        for ix in ([self.indexer] if self.indexer else []) + self._old_indexers:
+            try:
+                ix.stop()
+                ix.wait(1200)
+            except Exception:
+                pass
+
+    # --- filtering ---------------------------------------------------------
+    def apply_filter(self):
+        q = self.search.text().strip()
+        if self.mode == "files":
+            src = self.dir_sorted if self.nav_stack else self.files_sorted
+            toks = q.lower().split()
+            if not toks:
+                items = src
+            elif len(toks) == 1:
+                t = toks[0]
+                items = [it for it in src if t in it.name_l]
+            else:
+                items = [it for it in src if all(t in it.name_l for t in toks)]
+            if not src and self.nav_stack:
+                self.list.message = "This folder is empty"
+            elif not src:
+                self.list.message = ("Indexing your files\u2026" if self.index_state == "loading"
+                                     else "No files found")
+            else:
+                self.list.message = "No matching files"
+            self.list.set_items(items)
+            if self.index_state == "loading" and not src and not self.nav_stack:
+                self.sortbar.set_status(f"indexing\u2026 {self.index_count:,}")
+            elif toks:
+                self.sortbar.set_status(f"{len(items):,} of {len(src):,}")
+            else:
+                self.sortbar.set_status(f"{len(src):,} items" + (" \u00b7 updating\u2026" if self.index_state == "loading" and not self.nav_stack else ""))
+            return
+
+        if q.startswith(">"):
+            cmd = q[1:].strip()
+            self.list.message = f"\u21b5  Run  {cmd}" if cmd else "Type a command after  >"
+            self.list.set_items([])
+        elif q.startswith("?"):
+            words = q[1:].strip()
+            self.list.message = f"\u21b5  Search the web for  {words}" if words else "Type something after  ?"
+            self.list.set_items([])
+        else:
+            ql = q.lower()
+            items = [a for a in self.apps if not ql or ql in a.hay]
+            self.list.message = "No apps found"
+            self.list.set_items(items)
+
+    # --- launching ---------------------------------------------------------
+    def on_enter(self):
+        q = self.search.text().strip()
+        if self.mode == "apps" and q.startswith(">"):
+            if q[1:].strip():
+                run_command(q[1:].strip())
+                self.launched.emit()
+            return
+        if self.mode == "apps" and q.startswith("?"):
+            if q[1:].strip():
+                webbrowser.open("https://www.google.com/search?q=" + quote_plus(q[1:].strip()))
+                self.launched.emit()
+            return
+        cur = self.list.current()
+        if cur is not None:
+            self.launch_item(cur)
+
+    def on_reveal(self):
+        cur = self.list.current()
+        if cur is not None and cur.kind == "file":
+            reveal_path(cur.path)
+            self.launched.emit()
+
+    def launch_item(self, item):
+        if item.kind == "file":
+            if item.is_dir:
+                self.enter_folder(item.path)        # click into the folder
+                return
+            open_path(item.path)
+        else:
+            launch_app(item)
+        self.launched.emit()
+
+    def on_escape(self):
+        if self.settings.is_open():
+            self.settings.close_anim()
+            return True
+        return False
+
+    # --- painting ----------------------------------------------------------
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        card = QPainterPath()
+        card.addRoundedRect(r, CARD_RADIUS, CARD_RADIUS)
+
+        p.save()
+        p.setClipPath(card)
+        p.fillRect(r, self.theme.mix(*LIST_BG))                    # list area
+
+        # banner (zooms out while popping in).  IntersectClip keeps the rounded top corners!
+        hr = QRectF(0, 0, CARD_W, HEADER_H)
+        z = 1 + 0.25 * (1 - ease_out_cubic(clamp(self.seq)))
+        p.save()
+        p.setClipRect(hr, Qt.ClipOperation.IntersectClip)
+        p.translate(hr.center())
+        p.scale(z, z)
+        p.translate(-hr.center())
+        self._paint_banner(p, hr)
+        p.restore()
+        p.fillRect(hr, QColor(0, 0, 0, 22))
+
+        # light sweep
+        sh = clamp((self.seq - 0.15) / 0.6)
+        if 0 < sh < 1:
+            x = -220 + ease_out_cubic(sh) * (CARD_W + 440)
+            poly = QPolygonF([QPointF(x - 40 + 90, 0), QPointF(x + 40 + 90, 0),
+                              QPointF(x + 40 - 90, CARD_H), QPointF(x - 40 - 90, CARD_H)])
+            sg = QLinearGradient(x - 60, 0, x + 60, 0)
+            sg.setColorAt(0, QColor(255, 255, 255, 0))
+            sg.setColorAt(0.5, QColor(255, 255, 255, 80))
+            sg.setColorAt(1, QColor(255, 255, 255, 0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(sg)
+            p.drawPolygon(poly)
+        p.restore()
+
+        # accent glow that fades once the menu has landed
+        glow = (1 - clamp(self.seq / 0.9)) ** 1.5
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if glow > 0.01:
+            for i in range(1, 7):
+                p.setPen(QPen(with_alpha(self.accent, 90 * glow / i), i * 2.4))
+                p.drawPath(card)
+        p.setPen(QPen(self.theme.mix(*EDGE), 1.2))
+        p.drawPath(card)
+
+
+# ----------------------------------------------------------------------------
+# Background item (wallpaper + vignette + shadow + border) with parallax
+# ----------------------------------------------------------------------------
+class BgItem(QGraphicsItem):
+    def __init__(self, w, h, card_rect, parent=None):
+        super().__init__(parent)
+        self.w, self.h = w, h
+        self.sx = self.sy = 0.0
+        self.bg = QPixmap()
+        self.old_bg = None
+        self.t = 1.0
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.clip = QPainterPath()
+        self.clip.addRoundedRect(QRectF(1, 1, w - 2, h - 2), PANEL_RADIUS, PANEL_RADIUS)
+
+        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setClipPath(self.clip)
+        vg = QRadialGradient(QPointF(w / 2, h / 2), max(w, h) * 0.7)
+        vg.setColorAt(0.6, QColor(0, 0, 0, 0))
+        vg.setColorAt(1.0, QColor(0, 0, 0, 90))
+        p.fillRect(QRectF(0, 0, w, h), vg)
+        for i in range(16, 0, -1):                                  # soft shadow under the card
+            sp = QPainterPath()
+            sp.addRoundedRect(card_rect.adjusted(-i * 3, -i * 3 + 14, i * 3, i * 3 + 14),
+                              CARD_RADIUS + i * 3, CARD_RADIUS + i * 3)
+            p.fillPath(sp, QColor(0, 0, 0, 7))
+        p.setClipping(False)
+        bg = QLinearGradient(0, 0, w, h)
+        bg.setColorAt(0, QColor(255, 255, 255, 120))
+        bg.setColorAt(0.5, QColor(255, 255, 255, 25))
+        bg.setColorAt(1, QColor(255, 255, 255, 60))
+        p.setPen(QPen(bg, 1.6))
+        p.drawPath(self.clip)
+        p.end()
+        self.overlay = QPixmap.fromImage(img)
+
+    def boundingRect(self):
+        return QRectF(0, 0, self.w, self.h)
+
+    def set_bg(self, pm, animate=False):
+        if animate and not self.bg.isNull():
+            self.old_bg = self.bg
+            self.t = 0.0
+        else:
+            self.old_bg = None
+            self.t = 1.0
+        self.bg = pm
+        self.update()
+
+    def paint(self, p, option, widget=None):
+        p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        p.setClipPath(self.clip)
+        pos = QPointF(-BG_PAD + self.sx, -BG_PAD + self.sy)
+        if self.old_bg is None or self.t >= 1.0:
+            p.drawPixmap(pos, self.bg)
+        else:
+            # new wallpaper blooms outward from the centre (zooming down into place) with a glowing ring
+            t = self.t
+            p.drawPixmap(pos, self.old_bg)
+            c = QPointF(self.w / 2, self.h / 2)
+            r = math.hypot(self.w, self.h) / 2 * 1.08 * t
+            circ = QPainterPath()
+            circ.addEllipse(c, r, r)
+            p.save()
+            p.setClipPath(circ, Qt.ClipOperation.IntersectClip)
+            s = 1.12 - 0.12 * t
+            p.translate(c)
+            p.scale(s, s)
+            p.translate(-c)
+            p.drawPixmap(pos, self.bg)
+            p.restore()
+            fade = math.sin(math.pi * t)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for w, al in ((28, 25), (12, 70), (4, 210)):
+                p.setPen(QPen(QColor(255, 255, 255, int(al * fade)), w))
+                p.drawEllipse(c, r, r)
+        p.setClipping(False)
+        p.drawPixmap(0, 0, self.overlay)
+
+
+# ----------------------------------------------------------------------------
+# Window: transparent view holding the tilting surface (background + card)
+# ----------------------------------------------------------------------------
+class LauncherView(QGraphicsView):
+    def __init__(self, apps):
+        super().__init__()
+        self.setWindowTitle("Ohio")
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet("background:transparent;border:none;")
+        self.viewport().setAutoFillBackground(False)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
+                            | QPainter.RenderHint.TextAntialiasing)
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+        geo = QGuiApplication.primaryScreen().availableGeometry()
+        ex = max(0, min(EXTRA, (geo.width() - WIN_W) // 2))
+        ey = max(0, min(EXTRA, (geo.height() - WIN_H) // 2))
+        self.menu_scale = max(0.5, min(MENU_SCALE,
+                                       geo.height() * 0.92 / (WIN_H - 2 * MARGIN),
+                                       geo.width() * 0.92 / (WIN_W - 2 * MARGIN)))
+        self.win_w = WIN_W + 2 * ex
+        self.win_h = WIN_H + 2 * ey
+        self.setFixedSize(self.win_w, self.win_h)
+
+        self.pw, self.ph = WIN_W - 2 * MARGIN, WIN_H - 2 * MARGIN
+        self.mx = (self.win_w - self.pw) // 2
+        self.my = (self.win_h - self.ph) // 2
+        cx, cy = (self.pw - CARD_W) // 2, (self.ph - CARD_H) // 2
+
+        self.scene_ = QGraphicsScene(0, 0, self.win_w, self.win_h)
+        self.setScene(self.scene_)
+
+        # one parent item: the whole surface tilts together
+        self.root = QGraphicsRectItem(0, 0, self.pw, self.ph)
+        self.root.setPen(QPen(Qt.PenStyle.NoPen))
+        self.root.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.root.setPos(self.mx, self.my)
+        self.scene_.addItem(self.root)
+
+        self.bg_item = BgItem(self.pw, self.ph, QRectF(cx, cy, CARD_W, CARD_H), self.root)
+        self.bg_item.set_bg(build_background(self.pw, self.ph))
+
+        banner = build_banner()
+        self.card = Card(apps, banner, resolve_accent(banner))
+        self.card.launched.connect(self.start_pop_out)
+        self.card.closed.connect(self.start_exit)
+        self.card.bg_changed.connect(self.rebuild_bg)
+        self.proxy = self.scene_.addWidget(self.card)
+        self.proxy.setParentItem(self.root)
+        self.proxy.setPos(cx, cy)
+        if ITEM_CACHE:
+            # default cache size = the card's own size (an explicit bigger size made the
+            # card render oversized and out of place)
+            self.proxy.setCacheMode(QGraphicsItem.CacheMode.ItemCoordinateCache)
+
+        self.nx_s = self.ny_s = 0.0     # smoothed cursor position (-1..1)
+        self.intro = 0.0
+        self.pop = 0.0
+        self.leaving = False
+        self._last = None
+
+        self.intro_anim = QVariantAnimation(self)
+        self.intro_anim.setDuration(INTRO_MS)
+        c = QEasingCurve(QEasingCurve.Type.OutBack)
+        c.setOvershoot(1.25)
+        self.intro_anim.setEasingCurve(c)
+        self.intro_anim.setStartValue(0.0)
+        self.intro_anim.setEndValue(1.0)
+        self.intro_anim.valueChanged.connect(self._set_intro)
+
+        self.seq_anim = QVariantAnimation(self)
+        self.seq_anim.setDuration(INTRO_SEQ_MS)
+        self.seq_anim.setEasingCurve(QEasingCurve.Type.Linear)
+        self.seq_anim.setStartValue(0.0)
+        self.seq_anim.setEndValue(1.0)
+        self.seq_anim.valueChanged.connect(lambda v: self.card.set_seq(float(v)))
+
+        self.exit_anim = QVariantAnimation(self)
+        self.exit_anim.setDuration(380)
+        c2 = QEasingCurve(QEasingCurve.Type.InBack)
+        c2.setOvershoot(1.4)
+        self.exit_anim.setEasingCurve(c2)
+        self.exit_anim.valueChanged.connect(self._set_intro)
+        self.exit_anim.finished.connect(QApplication.quit)
+
+        self.pop_anim = QVariantAnimation(self)
+        self.pop_anim.setDuration(POP_OUT_MS)
+        self.pop_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.pop_anim.setStartValue(0.0)
+        self.pop_anim.setEndValue(1.0)
+        self.pop_anim.valueChanged.connect(self._set_pop)
+        self.pop_anim.finished.connect(QApplication.quit)
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(16)
+        self.timer.timeout.connect(self.tick)
+
+        self._bg_key = CFG["background_image"]
+        self.bg_anim = QVariantAnimation(self)
+        self.bg_anim.setDuration(1100)
+        self.bg_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self.bg_anim.setStartValue(0.0)
+        self.bg_anim.setEndValue(1.0)
+        self.bg_anim.valueChanged.connect(self._set_bgt)
+        self.bg_anim.finished.connect(self._bg_done)
+
+    def _set_bgt(self, v):
+        self.bg_item.t = float(v)
+        self.bg_item.update()
+
+    def _bg_done(self):
+        self.bg_item.old_bg = None
+        self.bg_item.t = 1.0
+        self.bg_item.update()
+
+    def rebuild_bg(self):
+        key = CFG["background_image"]
+        animate = key != self._bg_key               # animate only when the picture changes (not blur / dim)
+        self._bg_key = key
+        self.bg_item.set_bg(build_background(self.pw, self.ph), animate)
+        if animate:
+            self.bg_anim.stop()
+            self.bg_anim.start()
+
+    def shutdown(self):
+        self.card.shutdown()
+
+    def start(self):
+        geo = QGuiApplication.primaryScreen().availableGeometry()
+        self.move(geo.center().x() - self.win_w // 2, geo.center().y() - self.win_h // 2)
+        self.card.set_seq(0.0)
+        self._apply()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.proxy.setFocus()
+        self.card.search.setFocus()
+        self.intro_anim.start()
+        self.seq_anim.start()
+        self.timer.start()
+        QTimer.singleShot(1800, self._warm_index)
+
+    def _warm_index(self):
+        if not self.leaving and self.card.index_state == "idle":
+            self.card.start_indexing()
+
+    def start_exit(self):
+        if self.leaving:
+            return
+        self.leaving = True
+        self.intro_anim.stop()
+        self.seq_anim.stop()
+        self.exit_anim.setStartValue(float(self.intro))
+        self.exit_anim.setEndValue(0.0)
+        self.exit_anim.start()
+
+    def start_pop_out(self):
+        if self.leaving:
+            return
+        self.leaving = True
+        self.intro_anim.stop()
+        self.seq_anim.stop()
+        self.intro = 1.0
+        self.pop_anim.start()
+
+    def _set_intro(self, v):
+        self.intro = float(v)
+        self._apply()
+
+    def _set_pop(self, v):
+        self.pop = float(v)
+        self._apply()
+
+    def tick(self):
+        if self.leaving:
+            return
+        cur = QCursor.pos()
+        o = self.mapToGlobal(QPoint(self.width() // 2, self.height() // 2))
+        nx = clamp((cur.x() - o.x()) / (WIN_W / 2), -1, 1)
+        ny = clamp((cur.y() - o.y()) / (WIN_H / 2), -1, 1)
+        self.nx_s += (nx - self.nx_s) * TILT_SMOOTHING
+        self.ny_s += (ny - self.ny_s) * TILT_SMOOTHING
+        key = (round(self.nx_s, 3), round(self.ny_s, 3), CFG["max_tilt"])
+        if key != self._last:
+            self._last = key
+            self._apply()
+
+    def _apply(self):
+        pw, ph = self.pw, self.ph
+        sign = 1 if INVERT_TILT else -1
+        tilt = float(CFG["max_tilt"])
+        rx = sign * self.ny_s * tilt
+        ry = sign * self.nx_s * tilt
+        fl = 1.0 - self.intro                      # 1 -> 0 (goes slightly negative on the bounce)
+        s = (0.55 + 0.45 * self.intro) * (1 + POP_OUT_SCALE * self.pop) * self.menu_scale
+        t = QTransform()
+        t.translate(pw / 2, ph / 2 + fl * 70)
+        t.rotate(rx - fl * INTRO_FLIP, Qt.Axis.XAxis)        # flips up toward you
+        t.rotate(ry, Qt.Axis.YAxis)
+        t.rotate(fl * INTRO_ROLL)                            # roll straightens out
+        t.scale(s, s)
+        t.translate(-pw / 2, -ph / 2)
+        self.root.setTransform(t)
+        self.root.setOpacity(clamp(self.intro * 2.2) * (1 - self.pop))
+        self.bg_item.sx = sign * self.nx_s * BG_PAD * 0.45     # parallax
+        self.bg_item.sy = -sign * self.ny_s * BG_PAD * 0.45
+        self.bg_item.update()
+        self.viewport().update()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            if not self.card.on_escape():
+                self.start_exit()
+            return
+        super().keyPressEvent(e)
+
+    def mousePressEvent(self, e):
+        # drag the window by grabbing the background around the card
+        if e.button() == Qt.MouseButton.LeftButton:
+            it = self.itemAt(e.pos())
+            if it is None or it is self.bg_item or it is self.root:
+                h = self.windowHandle()
+                if h:
+                    h.startSystemMove()
+                    return
+        super().mousePressEvent(e)
+
+
+def main():
+    load_config()
+    ap = argparse.ArgumentParser(description="Ohio")
+    ap.add_argument("--bg", help="background image path")
+    ap.add_argument("--banner", help="banner (header) image path")
+    ap.add_argument("--blur", type=int, help="background blur radius (0 = sharp)")
+    ap.add_argument("--accent", help='selected colour, e.g. "#a8f5ea" or "auto"')
+    args = ap.parse_args()
+    if args.bg:
+        CFG["background_image"] = args.bg
+    if args.banner:
+        CFG["banner_image"] = args.banner
+    if args.blur is not None:
+        CFG["background_blur"] = args.blur
+    if args.accent:
+        CFG["accent"] = args.accent
+
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("Ohio")
+    font = QFont()
+    font.setFamilies(FONT_FAMILIES)
+    font.setPointSize(10)
+    app.setFont(font)
+
+    view = LauncherView(discover_apps())
+    app.aboutToQuit.connect(view.shutdown)
+    view.start()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
