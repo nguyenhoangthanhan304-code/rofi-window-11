@@ -23,6 +23,14 @@ NEW in this version
     * the sort bar slides open, the accent pill glides between chips, the arrow rotates,
       chips pop in one by one, hover fades, click bounce, status text slides
 
+FIXES in this build (nothing else was changed)
+    * scrolling fast:  rows are snapped to whole pixels + hard-clipped to the list, icons are
+      never loaded inside paintEvent any more, the intro stagger now really finishes
+    * missing apps:    Start-menu .url / .appref-ms shortcuts (Steam games ...) and every
+      Store / UWP app (Calculator, Photos, Settings ...) are listed now
+    * lag / freezes:   only the part of the window that changed is repainted, the file indexer
+      no longer fights the UI thread for the GIL, sorting 100k+ files is lazy, fonts are cached
+
 Settings are saved to  ~/.config/quick_launcher/config.json
 
 Install:  pip install PyQt6
@@ -41,13 +49,14 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import webbrowser
 from functools import lru_cache
 from operator import attrgetter
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from PyQt6.QtCore import (QEasingCurve, QFileInfo, QLocale, QPoint, QPointF, QRectF,
+from PyQt6.QtCore import (QEasingCurve, QFileInfo, QLocale, QPoint, QPointF, QRect, QRectF,
                           QSize, Qt, QThread, QTimer, QUrl, QVariantAnimation, pyqtSignal)
 from PyQt6.QtGui import (QBrush, QColor, QConicalGradient, QCursor, QFont, QFontMetrics,
                          QGuiApplication, QIcon, QImage, QImageReader, QLinearGradient,
@@ -78,7 +87,8 @@ DEFAULT_CFG = {
 CFG = dict(DEFAULT_CFG)
 CONFIG_DIR = Path.home() / ".config" / "quick_launcher"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-INDEX_CACHE = CONFIG_DIR / "file_index.pkl"
+INDEX_CACHE = CONFIG_DIR / "file_index_v2.pkl"
+APPS_CACHE = CONFIG_DIR / "start_apps.json"
 
 WIN_W, WIN_H = 1100, 800      # menu panel size (unchanged)
 MARGIN = 50                   # panel inset (unchanged)
@@ -97,6 +107,8 @@ INVERT_TILT = False
 SCROLL_SPEED = 2.4            # higher = faster wheel scrolling
 SCROLL_EASE = 0.24            # 0..1  higher = snappier, lower = floatier
 ITEM_CACHE = True             # cache the card as a texture while it tilts (much less lag)
+PARTIAL_REPAINT = True        # repaint only the part of the window that changed (huge win while scrolling,
+                              # because the window is big and transparent).  Set False if you ever see trails.
 
 INTRO_MS = 900                # pop-in (scale / flip)
 INTRO_SEQ_MS = 1250           # pop-in (rows, buttons, sweep, glow)
@@ -287,11 +299,13 @@ class App:
                 if h:
                     ic = QIcon(h) if os.path.isabs(h) and os.path.exists(h) else QIcon.fromTheme(h)
             else:
+                if self.command.lower().startswith("shell:"):
+                    return None          # Store / UWP app: no file to take an icon from -> coloured letter icon
                 if _provider is None:
                     _provider = QFileIconProvider()
                 ic = _provider.icon(QFileInfo(self.icon_hint or self.command))
             if ic is not None and not ic.isNull():
-                pm = ic.pixmap(QSize(128, 128))
+                pm = ic.pixmap(QSize(64, 64))
                 if not pm.isNull():
                     return pm
         except Exception:
@@ -325,10 +339,14 @@ class FileItem:
             self.icon_key = ("ext", self.ext)
 
 
+# icon cache:  key -> QPixmap | None (= "this item has no icon, draw the letter icon").
+# A key that is NOT in the dict has not been loaded yet.
 _icon_cache = {}
 
 
 def item_icon(item):
+    """Build + cache the 56px icon.  This can be slow (it asks the OS shell), so it is only ever
+    called from the idle icon loader or the pre-load before the window opens - never from paintEvent."""
     key = item.icon_key
     if key in _icon_cache:
         return _icon_cache[key]
@@ -375,6 +393,24 @@ def draw_fallback_icon(p, name, rect, radius=8):
 # ----------------------------------------------------------------------------
 # App discovery + launching
 # ----------------------------------------------------------------------------
+_SKIP_APP_RE = re.compile(r"uninstall|readme|release notes|license|documentation|\bhelp\b", re.I)
+START_EXTS = (".lnk", ".url", ".appref-ms")      # .url = Steam games etc, .appref-ms = ClickOnce apps
+
+
+def make_start_app(name, appid):
+    """An app that is launched through the shell's AppsFolder (Store / UWP apps and friends)."""
+    return App(name, "shell:AppsFolder\\" + appid,
+               category="Store app" if "!" in appid else "Application")
+
+
+def load_start_apps_cache():
+    try:
+        data = json.loads(APPS_CACHE.read_text("utf-8"))
+        return [(str(n), str(i)) for n, i in data]
+    except Exception:
+        return []
+
+
 def discover_apps():
     apps = {}
     try:
@@ -386,12 +422,18 @@ def discover_apps():
             for root in roots:
                 if not root.exists():
                     continue
-                for f in root.rglob("*.lnk"):
-                    name = f.stem
-                    if re.search(r"uninstall|readme|release notes|license|documentation|\bhelp\b", name, re.I):
-                        continue
-                    cat = f.parent.name if f.parent != root else "Application"
-                    apps.setdefault(name.lower(), App(name, str(f), category=cat))
+                base = os.path.normpath(str(root))
+                for dirpath, _dirs, files in os.walk(str(root)):
+                    cat = "Application" if os.path.normpath(dirpath) == base else os.path.basename(dirpath)
+                    for fn in files:
+                        stem, ext = os.path.splitext(fn)
+                        if ext.lower() not in START_EXTS or _SKIP_APP_RE.search(stem):
+                            continue
+                        apps.setdefault(stem.lower(), App(stem, os.path.join(dirpath, fn), category=cat))
+            # Store / UWP apps from the last background scan (AppScanner refreshes this list)
+            for name, appid in load_start_apps_cache():
+                if not _SKIP_APP_RE.search(name) and name.lower() not in apps:
+                    apps[name.lower()] = make_start_app(name, appid)
         elif sys.platform == "darwin":
             dirs = ["/Applications", "/Applications/Utilities", "/System/Applications",
                     "/System/Applications/Utilities", str(Path.home() / "Applications")]
@@ -434,10 +476,67 @@ def discover_apps():
     return sorted(apps.values(), key=lambda a: a.name.casefold())
 
 
+class AppScanner(QThread):
+    """Windows only: asks Windows itself for the full 'All apps' list (Get-StartApps) in the background,
+    so Store / UWP apps (Calculator, Photos, Settings, Xbox ...) show up too."""
+    found = pyqtSignal(object)          # [(name, appid), ...]
+    PS = ("[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; "
+          "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress")
+
+    def __init__(self):
+        super().__init__()
+        self._proc = None
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+        try:
+            if self._proc is not None and self._proc.poll() is None:
+                self._proc.kill()
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            self._proc = subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-Command", self.PS],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=0x08000000)                       # CREATE_NO_WINDOW
+            out, _ = self._proc.communicate(timeout=60)
+            if self._stop:
+                return
+            text = out.decode("utf-8-sig", "replace").strip()
+            if not text:
+                return
+            data = json.loads(text)
+            if isinstance(data, dict):
+                data = [data]
+            found = []
+            for d in data:
+                if isinstance(d, dict):
+                    n, i = str(d.get("Name") or "").strip(), str(d.get("AppID") or "").strip()
+                    if n and i:
+                        found.append((n, i))
+            if not found:
+                return
+            try:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                APPS_CACHE.write_text(json.dumps(found), "utf-8")
+            except Exception:
+                pass
+            self.found.emit(found)
+        except Exception as ex:
+            print("Start-apps scan failed:", ex)
+
+
 def launch_app(app):
     try:
         if sys.platform.startswith("win"):
-            os.startfile(app.command)  # noqa
+            if app.command.lower().startswith("shell:"):
+                subprocess.Popen(["explorer.exe", app.command])
+            else:
+                os.startfile(app.command)  # noqa
         elif sys.platform == "darwin":
             subprocess.Popen(["open", app.command])
         else:
@@ -531,9 +630,13 @@ def list_dir(path):
 
 
 class FileIndexer(QThread):
+    """Runs in the background.  Everything here is deliberately chopped into small pieces with tiny
+    sleeps in between: Python threads share ONE interpreter lock (the GIL), so a long unbroken loop
+    here would make the animation / scrolling in the UI thread stutter or freeze."""
     loaded = pyqtSignal(object)     # quick result from the on-disk cache
     done = pyqtSignal(object)       # fresh full scan
     progress = pyqtSignal(int)
+    CHUNK = 4000
 
     def __init__(self, roots):
         super().__init__()
@@ -547,15 +650,23 @@ class FileIndexer(QThread):
         sig = "|".join(self.roots)
         try:
             with open(INDEX_CACHE, "rb") as fh:
-                data = pickle.load(fh)
-            if data.get("sig") == sig and not self._stop:
-                self.loaded.emit([FileItem(*t) for t in data["items"]])
+                head = pickle.load(fh)
+                if head.get("sig") == sig and head.get("v") == 2:
+                    items = []
+                    for _ in range(int(head.get("chunks", 0))):
+                        if self._stop:
+                            return
+                        items.extend(FileItem(*t) for t in pickle.load(fh))
+                        time.sleep(0.001)                     # let the UI thread breathe
+                    if items and not self._stop:
+                        self.loaded.emit(items)
         except Exception:
             pass
 
         tuples = []
         stack = list(self.roots)
         count = 0
+        seen = 0
         while stack and not self._stop and count < MAX_FILES:
             d = stack.pop()
             try:
@@ -566,6 +677,9 @@ class FileIndexer(QThread):
                 for en in it:
                     if self._stop:
                         break
+                    seen += 1
+                    if seen % 400 == 0:
+                        time.sleep(0.001)                     # give the GIL back to the UI thread
                     try:
                         name = en.name
                         low = name.lower()
@@ -591,14 +705,32 @@ class FileIndexer(QThread):
                         continue
         if self._stop:
             return
-        items = [FileItem(*t) for t in tuples]
+        items = []
+        for n, t in enumerate(tuples):
+            items.append(FileItem(*t))
+            if n % 3000 == 2999:
+                if self._stop:
+                    return
+                time.sleep(0.001)
         self.done.emit(items)
+
+        tmp = str(INDEX_CACHE) + ".tmp"
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            with open(INDEX_CACHE, "wb") as fh:
-                pickle.dump({"sig": sig, "items": tuples}, fh, protocol=4)
+            chunks = [tuples[i:i + self.CHUNK] for i in range(0, len(tuples), self.CHUNK)]
+            with open(tmp, "wb") as fh:
+                pickle.dump({"sig": sig, "v": 2, "chunks": len(chunks)}, fh, protocol=4)
+                for ch in chunks:
+                    if self._stop:
+                        raise RuntimeError("stopped")
+                    pickle.dump(ch, fh, protocol=4)
+                    time.sleep(0.001)
+            os.replace(tmp, str(INDEX_CACHE))
         except Exception:
-            pass
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
 
 
 # ----------------------------------------------------------------------------
@@ -1011,12 +1143,19 @@ class ItemList(QWidget):
         self._drag = False
         self.f_name = mono_font(15)
         self.f_dim = mono_font(12)
+        self.f_msg = mono_font(14)
         self.fm_name = QFontMetrics(self.f_name)
         self.fm_dim = QFontMetrics(self.f_dim)
+        self._el_name = {}          # (text, width) -> elided text   (elidedText is slow to run 60x a second)
+        self._el_dim = {}
+        self._iq = {}               # icons waiting to be loaded (key -> item)
         self.setMouseTracking(True)
         self.timer = QTimer(self)
         self.timer.setInterval(16)
         self.timer.timeout.connect(self._tick)
+        self.icon_timer = QTimer(self)
+        self.icon_timer.setInterval(6)
+        self.icon_timer.timeout.connect(self._load_icons)
 
         # transition state
         self.tr = 1.0               # 0 -> 1 progress (1 = finished)
@@ -1030,6 +1169,51 @@ class ItemList(QWidget):
         self.tr_anim.setEndValue(1.0)
         self.tr_anim.valueChanged.connect(self._set_tr)
         self.tr_anim.finished.connect(self._tr_done)
+
+    # --- icons: never loaded while painting ----------------------------------
+    def preload(self, n=9):
+        """Load the first rows' real icons NOW (before the window opens) and queue a few more."""
+        for it in self.items[:n]:
+            item_icon(it)
+        for it in self.items[n:n + 60]:
+            self._queue_icon(it)
+
+    def _queue_icon(self, item):
+        k = item.icon_key
+        if k in _icon_cache or k in self._iq:
+            return
+        if len(self._iq) > 300:                       # scrolled far past them: forget the old requests
+            for old in list(self._iq)[:-80]:
+                del self._iq[old]
+        self._iq[k] = item
+        if not self.icon_timer.isActive():
+            self.icon_timer.start()
+
+    def _load_icons(self):
+        t0 = time.perf_counter()
+        loaded = False
+        while self._iq:
+            k, item = self._iq.popitem()              # newest request first = the rows you are looking at
+            if k not in _icon_cache:
+                item_icon(item)
+                loaded = True
+            if time.perf_counter() - t0 > 0.004:      # never hog the UI thread for more than ~4 ms
+                break
+        if loaded:
+            self.update()
+        if not self._iq:
+            self.icon_timer.stop()
+
+    def _elide(self, cache, fm, text, width):
+        k = (text, width)
+        s = cache.get(k)
+        if s is None:
+            if len(cache) > 4000:
+                cache.clear()
+            s = fm.elidedText(text, Qt.TextElideMode.ElideRight if cache is self._el_name
+                              else Qt.TextElideMode.ElideLeft, width)
+            cache[k] = s
+        return s
 
     # --- transition --------------------------------------------------------
     def begin_transition(self, direction):
@@ -1072,6 +1256,7 @@ class ItemList(QWidget):
         self.sel = 0 if items else -1
         self.sel_y = float(self._row_top(0))
         self.offset = self.target = 0.0
+        self._iq.clear()
         if self._pending is not None:
             self.tr_dir = self._pending
             self._pending = None
@@ -1079,6 +1264,23 @@ class ItemList(QWidget):
             self.tr_anim.stop()
             self.tr_anim.start()
         self._update_hover()
+        self.update()
+
+    def replace_items(self, items):
+        """Swap in a new list WITHOUT jumping: keeps the selected item and the scroll position."""
+        cur = self.current()
+        keep = -1
+        if cur is not None:
+            try:
+                keep = items.index(cur)
+            except ValueError:
+                keep = -1
+        self.items = items
+        self.sel = keep if keep >= 0 else (0 if items else -1)
+        self.sel_y = float(self._row_top(max(self.sel, 0)))
+        mo = self.max_offset()
+        self.offset = clamp(self.offset, 0, mo)
+        self.target = clamp(self.target, 0, mo)
         self.update()
 
     def current(self):
@@ -1110,6 +1312,16 @@ class ItemList(QWidget):
         if not self.timer.isActive():
             self.timer.start()
 
+    def _refresh_edges(self):
+        """Re-render the thin strips just above / below the list (banner + card border) so nothing
+        from a previous scroll position can ever linger there."""
+        par = self.parentWidget()
+        if par is None:
+            return
+        g = self.geometry()
+        par.update(QRect(g.left(), g.top() - 20, g.width(), 20))
+        par.update(QRect(g.left(), g.bottom() + 1, g.width(), 16))
+
     def _tick(self):
         moving = False
         d = self.target - self.offset
@@ -1128,6 +1340,7 @@ class ItemList(QWidget):
         if self._mouse is not None:
             self._update_hover()
         self.update()
+        self._refresh_edges()
         if not moving:
             self.timer.stop()
 
@@ -1138,7 +1351,7 @@ class ItemList(QWidget):
 
     # --- input -------------------------------------------------------------
     def _index_at(self, y):
-        i = int((y + self.offset - self.PAD) // self.ROW_H)
+        i = int((y + int(round(self.offset)) - self.PAD) // self.ROW_H)
         return i if 0 <= i < len(self.items) else -1
 
     def _update_hover(self):
@@ -1209,6 +1422,7 @@ class ItemList(QWidget):
                          | QPainter.RenderHint.TextAntialiasing)
         th = self.theme
         W, H = self.width(), self.height()
+        p.setClipRect(0, 0, W, H)                    # nothing can ever be painted outside the list
         n = len(self.items)
         tr, d = self.tr, self.tr_dir
         sl = TRANSITION_SLIDE
@@ -1226,19 +1440,19 @@ class ItemList(QWidget):
         if n == 0:
             if self.message:
                 p.setOpacity(ease_out_cubic(clamp((tr - 0.2) / 0.6)))
-                p.setFont(mono_font(14))
+                p.setFont(self.f_msg)
                 p.setPen(th.mix(*DIM))
                 p.drawText(QRectF(0, 0, W, H * 0.7), Qt.AlignmentFlag.AlignCenter, self.message)
             return
         rh = self.ROW_H
         x0, x1 = 20.0, W - 24.0
-        off = self.offset
+        off = int(round(self.offset))                # whole pixels only -> crisp text, icon + text never drift apart
         tpill = 1.0 if tr >= 1.0 else ease_out_cubic(clamp((tr - 0.12) / 0.5))
 
         # sliding selection pill
         if self.sel >= 0:
             a = ease_out_cubic(clamp((self.seq - 0.22) / 0.35)) * tpill
-            y = self.sel_y - off
+            y = int(round(self.sel_y)) - off
             if a > 0 and -rh < y < H:
                 pill = QRectF(x0 + (1 - tpill) * d * sl, y + 4 + ((1 - tpill) * 14 if d == 0 else 0),
                               x1 - x0, rh - 8)
@@ -1250,7 +1464,9 @@ class ItemList(QWidget):
         last = min(n - 1, int((off + H - self.PAD) // rh))
         col_text, col_dim = th.mix(*TEXT), th.mix(*DIM)
         for i in range(first, last + 1):
-            ap = ease_out_cubic(clamp((self.seq - (0.22 + min(i, 14) * 0.035)) / 0.4))
+            # (the stagger is capped at row 10 so it always FINISHES when the intro ends -
+            #  before, rows below #13 stayed 1px shifted + slightly see-through forever)
+            ap = ease_out_cubic(clamp((self.seq - (0.22 + min(i, 10) * 0.035)) / 0.4))
             if ap <= 0:
                 continue
             if tr >= 1.0:
@@ -1264,17 +1480,21 @@ class ItemList(QWidget):
             y = top - off
             r = QRectF(x0, y + 4, x1 - x0, rh - 8)
             ov = clamp(1 - abs(top - self.sel_y) / rh) * tpill   # how much the pill covers this row
-            p.save()
-            p.setOpacity(ap * tp)
-            p.translate((1 - ap) * 46 + (1 - tp) * d * sl, ((1 - tp) * 14) if d == 0 else 0)
+            settled = ap >= 0.999 and tp >= 0.999
+            if not settled:
+                p.save()
+                p.setOpacity(ap * tp)
+                p.translate((1 - ap) * 46 + (1 - tp) * d * sl, ((1 - tp) * 14) if d == 0 else 0)
             if i == self.hover and ov < 0.5:
                 hp = QPainterPath()
                 hp.addRoundedRect(r, r.height() / 2, r.height() / 2)
                 p.fillPath(hp, th.mix(*HOVER))
 
             icon_rect = QRectF(r.left() + 20, r.center().y() - 14, 28, 28)
-            pm = item_icon(item)
-            if pm is not None:
+            pm = _icon_cache.get(item.icon_key, False)
+            if pm is False:
+                self._queue_icon(item)               # real icon arrives a few ms later, scrolling never stalls
+            elif pm is not None:
                 p.drawPixmap(icon_rect, pm, QRectF(pm.rect()))
             else:
                 draw_fallback_icon(p, item.name if item.kind == "app" else (item.ext[1:] or item.name), icon_rect)
@@ -1287,7 +1507,7 @@ class ItemList(QWidget):
             p.setPen(lerp_color(col_text, SEL_TEXT, ov))
             p.drawText(QRectF(tx, r.top(), nw, r.height()),
                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                       self.fm_name.elidedText(item.name, Qt.TextElideMode.ElideRight, int(nw)))
+                       self._elide(self._el_name, self.fm_name, item.name, int(nw)))
             if par:
                 dw = avail - nw - 10
                 if dw > 30:
@@ -1296,8 +1516,9 @@ class ItemList(QWidget):
                     p.setPen(dc)
                     p.drawText(QRectF(tx + nw + 10, r.top(), dw, r.height()),
                                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                               self.fm_dim.elidedText(par, Qt.TextElideMode.ElideLeft, int(dw)))
-            p.restore()
+                               self._elide(self._el_dim, self.fm_dim, par, int(dw)))
+            if not settled:
+                p.restore()
 
         # scrollbar
         mo = self.max_offset()
@@ -1616,6 +1837,8 @@ class PathBar(SlideBar):
         self.t = 1.0
         self.hov = False
         self._down = False
+        self.f = mono_font(13)                  # built once (was rebuilt on every single repaint)
+        self.fm = QFontMetrics(self.f)
         self.setMouseTracking(True)
         self.anim = QVariantAnimation(self)
         self.anim.setDuration(PATH_TYPE_MS)
@@ -1711,9 +1934,8 @@ class PathBar(SlideBar):
         p.restore()
 
         # ---- path text ----
-        f = mono_font(13)
-        fm = QFontMetrics(f)
-        p.setFont(f)
+        fm = self.fm
+        p.setFont(self.f)
         w = self.width() - 70 - 26
         box = QRectF(70, 0, w, self.H)
         al = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
@@ -2169,10 +2391,12 @@ class Card(QWidget):
         self.mode = "apps"
         self.files = []
         self.files_sorted = []
+        self._sorted_key = None            # files_sorted is rebuilt lazily (only when the Files view needs it)
         self.index_state = "idle"          # idle | loading | ready
         self.index_count = 0
         self.indexer = None
         self._old_indexers = []
+        self.app_scanner = None
         self.nav_stack = []                # folders you have clicked into (empty = the full file list)
         self.dir_items = []
         self.dir_sorted = []
@@ -2397,6 +2621,30 @@ class Card(QWidget):
     def cycle_mode(self):
         self.set_mode("files" if self.mode == "apps" else "apps")
 
+    # --- Store / UWP apps (found in the background) ------------------------
+    def start_app_scan(self):
+        if not sys.platform.startswith("win") or self.app_scanner is not None:
+            return
+        self.app_scanner = AppScanner()
+        self.app_scanner.found.connect(self.merge_start_apps)
+        self.app_scanner.start(QThread.Priority.LowPriority)
+
+    def merge_start_apps(self, found):
+        known = {a.name.lower() for a in self.apps}
+        new = []
+        for name, appid in found:
+            low = name.lower()
+            if _SKIP_APP_RE.search(name) or low in known:
+                continue
+            known.add(low)
+            new.append(make_start_app(name, appid))
+        if not new:
+            return
+        self.apps = sorted(self.apps + new, key=lambda a: a.name.casefold())
+        q = self.search.text().strip()
+        if self.mode == "apps" and not q.startswith((">", "?")):
+            self.list.replace_items(self._app_items(q))      # keeps your scroll position + selection
+
     # --- file index --------------------------------------------------------
     def start_indexing(self):
         roots = [HOME] + [resolve_path(r) for r in CFG["extra_roots"] if os.path.isdir(resolve_path(r))]
@@ -2409,19 +2657,19 @@ class Card(QWidget):
         self.indexer.loaded.connect(self._files_loaded)
         self.indexer.done.connect(self._files_done)
         self.indexer.progress.connect(self._files_progress)
-        self.indexer.start()
+        self.indexer.start(QThread.Priority.LowestPriority)
 
     def _files_loaded(self, items):
         if self.index_state != "ready" and not self.files:
             self.files = items
-            self._resort()
+            self._sorted_key = None
             if self.mode == "files":
                 self.apply_filter()
 
     def _files_done(self, items):
         self.files = items
         self.index_state = "ready"
-        self._resort()
+        self._sorted_key = None
         if self.mode == "files":
             self.apply_filter()
 
@@ -2434,8 +2682,16 @@ class Card(QWidget):
         return {"name": attrgetter("name_l"), "date": attrgetter("mtime"),
                 "size": attrgetter("size"), "type": attrgetter("ext", "name_l")}[CFG["file_sort"]]
 
+    def _ensure_sorted(self):
+        """Sorting 100k+ files takes a moment, so it only happens when the Files view actually needs it
+        (before it was done on the UI thread every time an index finished, even in Apps mode)."""
+        key = (CFG["file_sort"], bool(CFG["file_sort_asc"]), id(self.files), len(self.files))
+        if key != self._sorted_key:
+            self.files_sorted = sorted(self.files, key=self._sort_getter(), reverse=not CFG["file_sort_asc"])
+            self._sorted_key = key
+
     def _resort(self):
-        self.files_sorted = sorted(self.files, key=self._sort_getter(), reverse=not CFG["file_sort_asc"])
+        self._sorted_key = None
         if self.nav_stack:
             self._resort_dir()
 
@@ -2485,6 +2741,12 @@ class Card(QWidget):
         self.apply_filter()
 
     def shutdown(self):
+        if self.app_scanner is not None:
+            try:
+                self.app_scanner.stop()
+                self.app_scanner.wait(1500)
+            except Exception:
+                pass
         for ix in ([self.indexer] if self.indexer else []) + self._old_indexers:
             try:
                 ix.stop()
@@ -2493,9 +2755,15 @@ class Card(QWidget):
                 pass
 
     # --- filtering ---------------------------------------------------------
+    def _app_items(self, q):
+        ql = q.lower()
+        return [a for a in self.apps if not ql or ql in a.hay]
+
     def apply_filter(self):
         q = self.search.text().strip()
         if self.mode == "files":
+            if not self.nav_stack:
+                self._ensure_sorted()
             src = self.dir_sorted if self.nav_stack else self.files_sorted
             toks = q.lower().split()
             if not toks:
@@ -2530,8 +2798,7 @@ class Card(QWidget):
             self.list.message = f"\u21b5  Search the web for  {words}" if words else "Type something after  ?"
             self.list.set_items([])
         else:
-            ql = q.lower()
-            items = [a for a in self.apps if not ql or ql in a.hay]
+            items = self._app_items(q)
             self.list.message = "No apps found"
             self.list.set_items(items)
 
@@ -2723,7 +2990,10 @@ class LauncherView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
                             | QPainter.RenderHint.TextAntialiasing)
-        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+        # The window is big (the tilt needs the room) and transparent.  Repainting ALL of it for every scroll
+        # tick / hover / caret blink was the main source of lag, so only the changed part is repainted now.
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate
+                                   if PARTIAL_REPAINT else QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         geo = QGuiApplication.primaryScreen().availableGeometry()
         ex = max(0, min(EXTRA, (geo.width() - WIN_W) // 2))
         ey = max(0, min(EXTRA, (geo.height() - WIN_H) // 2))
@@ -2842,6 +3112,9 @@ class LauncherView(QGraphicsView):
         self.move(geo.center().x() - self.win_w // 2, geo.center().y() - self.win_h // 2)
         self.card.set_seq(0.0)
         self._apply()
+        # Real icons for the first rows are fetched NOW, before the animation starts.  Before, they were
+        # fetched from the OS shell during the first painted frames, which froze the pop-in.
+        self.card.list.preload()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -2850,7 +3123,12 @@ class LauncherView(QGraphicsView):
         self.intro_anim.start()
         self.seq_anim.start()
         self.timer.start()
-        QTimer.singleShot(1800, self._warm_index)
+        QTimer.singleShot(1500, self._start_app_scan)
+        QTimer.singleShot(3500, self._warm_index)
+
+    def _start_app_scan(self):
+        if not self.leaving:
+            self.card.start_app_scan()
 
     def _warm_index(self):
         if not self.leaving and self.card.index_state == "idle":
@@ -2917,7 +3195,8 @@ class LauncherView(QGraphicsView):
         self.bg_item.sx = sign * self.nx_s * BG_PAD * 0.45     # parallax
         self.bg_item.sy = -sign * self.ny_s * BG_PAD * 0.45
         self.bg_item.update()
-        self.viewport().update()
+        if not PARTIAL_REPAINT:
+            self.viewport().update()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
@@ -2954,6 +3233,10 @@ def main():
         CFG["background_blur"] = args.blur
     if args.accent:
         CFG["accent"] = args.accent
+
+    # Background threads (file index, app scan) share Python's one interpreter lock with the UI.
+    # A shorter switch interval lets the UI thread grab it back almost instantly -> no stutter.
+    sys.setswitchinterval(0.001)
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Ohio")
